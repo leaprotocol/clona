@@ -1,7 +1,6 @@
 gphoto2==2.3.4
 numpy==1.24.2
 rawpy==0.18.0
-
 opencv-python~=4.8.0.76
 pip~=22.0.2
 attrs~=21.2.0
