@@ -12,10 +12,15 @@ The application consists of four main parts:
 
 ## Features
 
-- Capture images in RAW format using a connected camera.
-- Segment and preprocess images to locate calibration elements.
-- Analyze lens properties including sharpness, vignetting, PSF, and bokeh.
-- Display results in a user-friendly web interface.
+- Image Acquisition in RAW format
+- Image Processing and Analysis
+- Evaluation of Lens Properties (Sharpness, Vignetting, PSF, Bokeh)
+- Web Interface for User Interaction
+- Session Management (Save and Load)
+
+## Repository
+
+The source code for this project is available on GitHub: [Clona Repository](https://github.com/N4M3L355/clona)
 
 ## Installation
 
@@ -83,4 +88,4 @@ This project is licensed under the MIT License. See the LICENSE file for more de
 
 ## Contact
 
-For any questions or inquiries, please contact [Your Name] at [Your Email].
+For any questions or inquiries, please contact Lea Králová at lea.kralova00@gmail.com .

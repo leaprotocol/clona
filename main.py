@@ -7,9 +7,12 @@ from camera import initialize_camera, list_connected_cameras, start_camera_check
     enable_viewfinder, disable_viewfinder, set_eos_remote_release
 from image_processing import capture_photo_and_display, analyze_image
 from ui import setup_ui
-
+import logging
 
 def main():
+
+    logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+
     global main_container, status_label, image_display, context
     context = gp.Context()
 
@@ -18,6 +21,7 @@ def main():
     ui.label('Clona')
     status_label = ui.label('Camera connection not initialized yet')
 
+    initialize_camera()  # Ensure the camera is initialized at the start
     setup_ui()
 
     ui.run()
