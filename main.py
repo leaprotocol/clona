@@ -1,31 +1,37 @@
-from nicegui import ui
-import threading
-import gphoto2 as gp
-from config import *
-from camera import initialize_camera, list_connected_cameras, start_camera_check, debug, zoom_out, zoom_in, \
-    enable_cancel_auto_focus, disable_cancel_auto_focus, enable_auto_focus_drive, disable_auto_focus_drive, \
-    enable_viewfinder, disable_viewfinder, set_eos_remote_release
-from image_processing import capture_photo_and_display, analyze_image
-from ui import setup_ui
 import logging
+from camera_manager import CameraManager
+from dataset_manager import DatasetManager
+from ui import LensAnalysisUI
+
+
+def setup_logging():
+    """Set up application logging"""
+    # Remove existing handlers first
+    logger = logging.getLogger()
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
+
+    # Add basic console handler
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter(
+        '%(asctime)s [%(levelname)s] %(message)s'
+    ))
+    logging.getLogger().addHandler(handler)
+    logging.getLogger().setLevel(logging.INFO)
 
 def main():
+    """Main application entry point"""
+    # Initialize logging
+    setup_logging()
+    logging.info("Starting Lens Analysis Application")
 
-    logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+    # Initialize managers
+    camera_manager = CameraManager()
+    dataset_manager = DatasetManager()
 
-    global main_container, status_label, image_display, context
-    context = gp.Context()
-
-    main_container = ui.column()
-    list_connected_cameras()
-    ui.label('Clona')
-    status_label = ui.label('Camera connection not initialized yet')
-
-    initialize_camera()  # Ensure the camera is initialized at the start
-    setup_ui()
-
-    ui.run()
-
+    # Initialize and run UI
+    app_ui = LensAnalysisUI(camera_manager, dataset_manager)
+    app_ui.run()
 
 if __name__ in {"__main__", "__mp_main__"}:
     main()
