@@ -5,6 +5,7 @@ import time
 from typing import Callable
 from datetime import datetime
 import gphoto2 as gp  # Add this import
+import shutil
 
 class LensAnalysisUI:
     def __init__(self, camera_manager, dataset_manager):
@@ -97,7 +98,6 @@ class LensAnalysisUI:
 
     def show_aperture_selection_dialog(self):
         """Show dialog for selecting multiple apertures for batch capture"""
-        # Get available apertures from camera
         available_apertures = self.print_available_apertures()
         if not available_apertures:
             ui.notify('Could not get aperture settings from camera', type='negative')
@@ -107,15 +107,12 @@ class LensAnalysisUI:
 
         def close_dialog():
             dialog.close()
-            ui.notify('Capture cancelled', type='warning')
+            ui.notify('Cancelled', type='warning')
 
         with dialog, ui.card().classes('p-4 min-w-[300px]'):
-            # Add close button in top right
             with ui.row().classes('w-full justify-between items-center'):
-                ui.label('Select Aperture Values').classes('text-xl')
+                ui.label('Select Apertures').classes('text-xl')
                 ui.button(text='✕', on_click=close_dialog).classes('text-gray-500')
-
-            ui.separator().classes('my-4')
 
             aperture_switches = []
             for aperture in available_apertures:
@@ -136,11 +133,12 @@ class LensAnalysisUI:
                     )
                 ).classes('bg-green-500 text-white')
 
-        # Allow dialog to be closed by clicking outside or pressing Escape
+        # Add escape key and outside click handlers
         dialog.on_escape = close_dialog
         dialog.on_click_outside = close_dialog
 
         dialog.open()
+
     def do_capture_with_aperture(self, dialog, aperture):
         """Capture photo with the selected aperture value"""
         dialog.close()
@@ -599,49 +597,43 @@ class LensAnalysisUI:
 
     def do_batch_capture(self, dialog, apertures):
         """Capture multiple photos with different aperture values"""
+        if not self.current_scenario:
+            ui.notify('Please select a scenario first', type='warning')
+            return
+
         if not apertures:
             ui.notify('Please select at least one aperture value', type='warning')
             return
 
         logging.info(f"Starting batch capture for apertures: {apertures}")
         dialog.close()
-        os.makedirs("captures", exist_ok=True)
 
-        total = len(apertures)
+        # Create dataset directory
+        dataset_path = os.path.join("datasets", self.current_dataset['id'], "photos")
+        os.makedirs(dataset_path, exist_ok=True)
+
         for idx, aperture in enumerate(apertures, 1):
-            logging.info(f"Processing aperture {aperture} ({idx}/{total})")
-            ui.notify(f'Setting aperture to {aperture} ({idx}/{total})...', type='info')
-
             try:
-                # Get camera config
-                logging.info("Getting camera config...")
+                # Set aperture
                 camera_config = self.camera_manager.camera.get_config()
-
-                # Find and set aperture
-                logging.info("Looking for aperture setting...")
                 OK, aperture_widget = gp.gp_widget_get_child_by_name(camera_config, 'aperture')
                 if OK >= gp.GP_OK:
-                    logging.info(f"Setting aperture value to {aperture}")
-                    # Set the aperture value
                     aperture_widget.set_value(aperture)
-                    logging.info("Applying camera config...")
                     self.camera_manager.camera.set_config(camera_config)
-                    time.sleep(1)  # Short delay to let camera apply setting
-                else:
-                    logging.error("Could not find aperture setting")
-                    ui.notify('Could not find aperture setting', type='negative')
-                    continue
+                    time.sleep(1)
 
                 # Capture photo
-                logging.info("Initiating capture...")
-                ui.notify(f'Capturing photo at {aperture}...', type='ongoing')
-                path = self.camera_manager.capture_image("captures")
+                temp_path = self.camera_manager.capture_image("captures")
+                if temp_path:
+                    # Move to dataset location
+                    final_filename = f"vignette_f{aperture}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.CR2"
+                    final_path = os.path.join(dataset_path, final_filename)
+                    shutil.move(temp_path, final_path)
 
-                if path:
-                    logging.info(f"Photo saved to {path}")
+                    # Add to scenario
                     photo_info = {
-                        'filename': os.path.basename(path),
-                        'path': path,
+                        'filename': final_filename,
+                        'path': final_path,
                         'timestamp': datetime.now().strftime("%Y%m%d_%H%M%S"),
                         'metadata': {
                             'aperture': aperture
@@ -652,19 +644,22 @@ class LensAnalysisUI:
                         self.current_scenario['photos'] = []
                     self.current_scenario['photos'].append(photo_info)
 
-                    # Update UI
-                    self.select_scenario(self.current_scenario)
+                    # Persist changes
+                    self.dataset_manager.update_scenario(
+                        self.current_dataset['id'],
+                        self.current_scenario
+                    )
+
+                    # Update UI asynchronously
                     ui.notify(f'Photo captured at {aperture}', type='positive')
-                else:
-                    logging.error(f"Failed to capture photo at {aperture}")
-                    ui.notify(f'Failed to capture photo at {aperture}', type='negative')
 
             except Exception as e:
                 logging.error(f"Error during capture at {aperture}: {e}")
                 ui.notify(f'Error during capture at {aperture}: {str(e)}', type='negative')
                 continue
 
-        logging.info("Batch capture complete")
+        # Final UI update
+        self.select_scenario(self.current_scenario)
         ui.notify('Batch capture complete', type='positive')
 
 
@@ -713,32 +708,83 @@ class LensAnalysisUI:
             logging.error(f"Error getting aperture settings: {e}")
             return None
 
+    # Add this method to the LensAnalysisUI class in ui.py
+
     def show_photo_analysis(self, scenario, photo_info):
         """Show analysis dialog for a photo"""
         dialog = ui.dialog()
-        with dialog, ui.card().classes('p-4 min-w-[400px]'):
-            ui.label('Photo Analysis').classes('text-xl mb-4')
+        with dialog, ui.card().classes('p-4 min-w-[600px]'):
+            with ui.row().classes('w-full justify-between items-center'):
+                ui.label('Vignetting Analysis Results').classes('text-xl')
+                ui.button(text='✕', on_click=dialog.close).classes('text-gray-500')
 
             if 'analysis' not in photo_info:
-                ui.button(
-                    'Analyze Vignetting',
-                    on_click=lambda: self.run_photo_analysis(scenario, photo_info, dialog)
-                ).classes('bg-blue-500 text-white')
+                with ui.column().classes('gap-4 items-center'):
+                    ui.label('No analysis results available').classes('text-gray-500 italic')
+                    ui.button(
+                        'Analyze Now',
+                        on_click=lambda: self.run_photo_analysis(scenario, photo_info, dialog)
+                    ).classes('bg-blue-500 text-white')
             else:
-                # Show analysis results
                 results = photo_info['analysis']['vignetting_results']
-                ui.label(f"Overall vignetting score: {results['vignetting_score']:.1f}/100").classes('font-bold')
 
-                # Show corner ratios in a grid
-                with ui.grid(columns=2).classes('gap-4 mt-4'):
-                    for corner, ratio in results['corner_ratios'].items():
-                        ui.label(f"{corner}: {ratio:.2f}")
+                # Show score and timestamp
+                with ui.row().classes('w-full justify-between mb-4'):
+                    ui.label(
+                        f"Overall Score: {results['vignetting_score']:.1f}/100"
+                    ).classes('text-xl font-bold')
+                    ui.label(
+                        f"Analyzed: {photo_info['analysis']['analyzed_at']}"
+                    ).classes('text-gray-500')
 
-                # Show visualization
-                if 'visualization_path' in photo_info['analysis']:
-                    ui.image(photo_info['analysis']['visualization_path']).classes('mt-4')
+                # Show visualization and metrics side by side
+                with ui.row().classes('gap-4'):
+                    # Left side - Visualization
+                    with ui.card().classes('p-2'):
+                        ui.label('Intensity Map').classes('font-bold mb-2')
+                        if 'visualization_path' in photo_info['analysis']:
+                            ui.image(photo_info['analysis']['visualization_path'])
 
-            ui.button('Close', on_click=dialog.close).classes('bg-gray-500 text-white mt-4')
+                    # Right side - Metrics
+                    with ui.card().classes('p-4'):
+                        ui.label('Corner Measurements').classes('font-bold mb-2')
+                        # Show corner ratios in a grid
+                        with ui.grid(columns=2).classes('gap-4'):
+                            for corner, ratio in results['corner_ratios'].items():
+                                with ui.card().classes('p-2'):
+                                    ui.label(corner.replace('_', ' ').title())
+                                    ui.label(f"{ratio:.2f}").classes(
+                                        'font-bold text-lg ' +
+                                        ('text-green-500' if ratio > 0.8 else
+                                         'text-yellow-500' if ratio > 0.6 else
+                                         'text-red-500')
+                                    )
+
+                        ui.label(f"Average corner ratio: {results['average_corner_ratio']:.2f}").classes('mt-4')
+
+                # Analysis interpretation
+                with ui.card().classes('p-4 mt-4 bg-gray-50'):
+                    ui.label('Analysis Interpretation').classes('font-bold mb-2')
+                    score = results['vignetting_score']
+                    if score >= 80:
+                        msg = "Excellent - Very minimal vignetting detected"
+                    elif score >= 60:
+                        msg = "Good - Some light falloff but within normal range"
+                    else:
+                        msg = "Significant vignetting detected"
+                    ui.label(msg)
+
+            # Bottom buttons
+            with ui.row().classes('gap-2 justify-end mt-4'):
+                if 'analysis' in photo_info:
+                    ui.button(
+                        'Re-analyze',
+                        on_click=lambda: self.run_photo_analysis(scenario, photo_info, dialog)
+                    ).classes('bg-blue-500 text-white')
+                ui.button('Close', on_click=dialog.close).classes('bg-gray-500 text-white')
+
+        dialog.open()
+
 
     def run_photo_analysis(self, scenario, photo_info, dialog=None):
         """Run analysis on a photo"""

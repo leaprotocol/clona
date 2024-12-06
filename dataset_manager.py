@@ -284,3 +284,27 @@ class DatasetManager:
         except Exception as e:
             logging.error(f"Error adding photo to scenario: {e}")
             return False
+
+    def update_scenario(self, dataset_id: str, scenario):
+        """Update scenario information in dataset"""
+        try:
+            dataset = self.load_dataset(dataset_id)
+            if not dataset:
+                return False
+
+            # Find and update the scenario
+            for i, s in enumerate(dataset['scenarios']):
+                if s['id'] == scenario['id']:
+                    dataset['scenarios'][i] = scenario
+                    break
+
+            # Save updated dataset info
+            info_path = os.path.join(self.base_path, dataset_id, "info.json")
+            with open(info_path, 'w') as f:
+                json.dump(dataset, f, indent=2)
+
+            logging.info(f"Updated scenario in dataset {dataset_id}")
+            return True
+        except Exception as e:
+            logging.error(f"Error updating scenario: {e}")
+            return False
