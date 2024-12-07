@@ -7,6 +7,7 @@ from datetime import datetime
 import gphoto2 as gp  # Add this import
 import shutil
 
+
 class LensAnalysisUI:
     def __init__(self, camera_manager, dataset_manager):
         self.camera_manager = camera_manager
@@ -47,7 +48,6 @@ class LensAnalysisUI:
             '%(asctime)s [%(levelname)s] %(message)s'
         ))
         logging.getLogger().addHandler(handler)
-
 
     def update_camera_status(self):
         """Update camera status display and button states"""
@@ -93,6 +93,8 @@ class LensAnalysisUI:
         # For vignette scenario, ask for aperture setting first
         if self.current_scenario['type'] == 'vignette':
             self.show_aperture_selection_dialog()
+        elif self.current_scenario['type'] == 'distortion':
+            self.do_capture()  # Regular capture for distortion
         else:
             self.do_capture()  # Regular capture for other scenarios
 
@@ -100,7 +102,9 @@ class LensAnalysisUI:
         """Show dialog for selecting multiple apertures for batch capture"""
         available_apertures = self.print_available_apertures()
         if not available_apertures:
-            ui.notify('Could not get aperture settings from camera', type='negative')
+            ui.notify(
+                'Could not get aperture settings from camera - make sure camera is connected and supports aperture control',
+                type='negative')
             return
 
         dialog = ui.dialog()
@@ -187,37 +191,58 @@ class LensAnalysisUI:
                     ui.notify(f'Error capturing photo: {str(e)}', type='negative')
                     logging.error(f"Error capturing photo: {e}")
 
+    # ui.py
 
     def do_capture(self):
         """Regular capture without aperture metadata"""
-        # Ensure captures directory exists
-        os.makedirs("captures", exist_ok=True)
-
-        ui.notify('Capturing photo...', type='ongoing')
-
         try:
-            path = self.camera_manager.capture_image("captures")
-            if path:
-                # Add photo to scenario with basic metadata
+            # Create dataset directory structure if it doesn't exist
+            dataset_path = os.path.join("datasets", self.current_dataset['id'], "photos")
+            os.makedirs(dataset_path, exist_ok=True)
+
+            # Temporary capture in captures dir
+            temp_path = self.camera_manager.capture_image("captures")
+            if temp_path:
+                # Create final filename and path
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                final_filename = f"{self.current_scenario['type']}_{timestamp}_{os.path.basename(temp_path)}"
+                final_path = os.path.join(dataset_path, final_filename)
+
+                # Move file to dataset directory
+                shutil.move(temp_path, final_path)
+
+                # Add photo to scenario with metadata
                 photo_info = {
-                    'filename': os.path.basename(path),
-                    'path': path,
-                    'timestamp': datetime.now().strftime("%Y%m%d_%H%M%S"),
-                    'metadata': {}
+                    'filename': final_filename,
+                    'path': final_path,
+                    'timestamp': timestamp,
+                    'metadata': {
+                        'scenario_type': self.current_scenario['type'],
+                        'scenario_id': self.current_scenario['id']
+                    }
                 }
 
                 if 'photos' not in self.current_scenario:
                     self.current_scenario['photos'] = []
                 self.current_scenario['photos'].append(photo_info)
 
-                # Update UI
-                self.select_scenario(self.current_scenario)
-                ui.notify('Photo captured successfully', type='positive')
+                # Save updated scenario to dataset
+                if self.dataset_manager.update_scenario(
+                        self.current_dataset['id'],
+                        self.current_scenario
+                ):
+                    ui.notification('Photo captured and saved successfully', type='positive', position='bottom')
+                    # Update UI
+                    self.select_scenario(self.current_scenario)
+                else:
+                    ui.notification('Photo captured but failed to update dataset', type='warning', position='bottom')
             else:
-                ui.notify('Failed to capture photo', type='negative')
+                ui.notification('Failed to capture photo', type='negative', position='bottom')
+
         except Exception as e:
-            ui.notify(f'Error capturing photo: {str(e)}', type='negative')
+            ui.notification(f'Error capturing photo: {str(e)}', type='negative', position='bottom')
             logging.error(f"Error capturing photo: {e}")
+
 
     def create_camera_controls(self):
         """Create camera control section"""
@@ -306,9 +331,9 @@ class LensAnalysisUI:
                 label='Scenario Type',
                 options=[
                     ('vignette', 'Vignetting Test'),
+                    ('distortion', 'Distortion Analysis'),  # Make sure this matches exactly
                     ('bokeh', 'Bokeh Analysis'),
-                    ('sharpness', 'Sharpness Test'),
-                    ('distortion', 'Distortion Analysis')
+                    ('sharpness', 'Sharpness Test')
                 ]
             ).classes('w-full mb-4')
 
@@ -434,15 +459,24 @@ class LensAnalysisUI:
                             with ui.card().classes('p-4'):
                                 ui.label(f"Filename: {photo['filename']}").classes('font-bold')
                                 ui.label(f"Taken: {photo['timestamp']}")
-                                if 'metadata' in photo and 'aperture' in photo['metadata']:
-                                    ui.label(f"Aperture: f/{photo['metadata']['aperture']}")
 
                                 with ui.row().classes('gap-2 mt-2'):
-                                    if scenario['type'] == 'vignette':
+                                    if scenario['type'] == 'distortion':
                                         ui.button(
-                                            'View Analysis',
-                                            on_click=lambda p=photo: self.show_photo_analysis(scenario, p)
+                                            'Analyze Distortion',
+                                            on_click=lambda p=photo: self.run_photo_analysis(scenario, p)
                                         ).classes('bg-blue-500 text-white p-2')
+                                    elif scenario['type'] == 'vignette':
+                                        ui.button(
+                                            'Analyze Vignette',
+                                            on_click=lambda p=photo: self.run_photo_analysis(scenario, p)
+                                        ).classes('bg-blue-500 text-white p-2')
+
+                                    if 'analysis' in photo:
+                                        ui.button(
+                                            'View Results',
+                                            on_click=lambda p=photo: self.show_photo_analysis(scenario, p)
+                                        ).classes('bg-green-500 text-white p-2')
 
                                     ui.button(
                                         'Delete Photo',
@@ -464,28 +498,8 @@ class LensAnalysisUI:
                             on_click=self.handle_capture_photo
                         ).classes('bg-green-500 text-white')
 
-        def delete_photo(self, scenario, photo):
-            """Delete a photo from the scenario"""
-            try:
-                # Remove the file
-                if os.path.exists(photo['path']):
-                    os.remove(photo['path'])
-
-                # Remove from photos list
-                scenario['photos'].remove(photo)
-
-                # Remove analysis visualization if it exists
-                if 'analysis' in photo and 'visualization_path' in photo['analysis']:
-                    if os.path.exists(photo['analysis']['visualization_path']):
-                        os.remove(photo['analysis']['visualization_path'])
-
-                # Refresh display
-                self.select_scenario(scenario)
-                ui.notify('Photo deleted', type='warning')
-            except Exception as e:
-                ui.notify(f'Error deleting photo: {str(e)}', type='negative')
-                logging.error(f"Error deleting photo: {e}")
-
+            # For debugging - show current scenario state
+            logging.debug(f"Current scenario state: {scenario}")
 
     def refresh_dataset_list(self):
         """Refresh the dataset list display"""
@@ -662,8 +676,6 @@ class LensAnalysisUI:
         self.select_scenario(self.current_scenario)
         ui.notify('Batch capture complete', type='positive')
 
-
-
     def do_capture_confirmed(self, dialog, aperture):
         """Execute single capture after user confirms aperture is set"""
         dialog.close()
@@ -695,27 +707,40 @@ class LensAnalysisUI:
         except Exception as e:
             ui.notify(f'Error capturing photo: {str(e)}', type='negative')
             logging.error(f"Error capturing photo: {e}")
+
     def print_available_apertures(self):
         """Print available aperture settings for the camera"""
         try:
+            if not self.camera_manager.connected or not self.camera_manager.camera:
+                logging.error("Cannot get aperture settings: Camera not connected")
+                return None
+
             camera_config = self.camera_manager.camera.get_config()
             OK, aperture_widget = gp.gp_widget_get_child_by_name(camera_config, 'aperture')
             if OK >= gp.GP_OK:
                 choices = [aperture_widget.get_choice(i) for i in range(aperture_widget.count_choices())]
                 logging.info(f"Available aperture settings: {choices}")
                 return choices
+            else:
+                logging.error("Could not find aperture setting in camera config")
+                return None
+
         except Exception as e:
             logging.error(f"Error getting aperture settings: {e}")
             return None
 
-    # Add this method to the LensAnalysisUI class in ui.py
-
     def show_photo_analysis(self, scenario, photo_info):
         """Show analysis dialog for a photo"""
+        # Add logging
+        logging.info(f"Showing analysis for photo: {photo_info['path']}")
+        logging.info(f"Analysis data: {photo_info.get('analysis')}")
+
         dialog = ui.dialog()
-        with dialog, ui.card().classes('p-4 min-w-[600px]'):
+        with dialog, ui.card().classes('p-4 min-w-[800px]'):
             with ui.row().classes('w-full justify-between items-center'):
-                ui.label('Vignetting Analysis Results').classes('text-xl')
+                title = 'Distortion Analysis Results' if scenario[
+                                                             'type'] == 'distortion' else 'Vignetting Analysis Results'
+                ui.label(title).classes('text-xl')
                 ui.button(text='✕', on_click=dialog.close).classes('text-gray-500')
 
             if 'analysis' not in photo_info:
@@ -726,86 +751,264 @@ class LensAnalysisUI:
                         on_click=lambda: self.run_photo_analysis(scenario, photo_info, dialog)
                     ).classes('bg-blue-500 text-white')
             else:
-                results = photo_info['analysis']['vignetting_results']
+                if scenario['type'] == 'distortion':
+                    # Access results directly as they're not nested
+                    self.show_distortion_results(photo_info['analysis'])
+                elif scenario['type'] == 'vignette':
+                    # Access vignetting results which are nested
+                    self.show_vignetting_results(photo_info['analysis'])
 
-                # Show score and timestamp
-                with ui.row().classes('w-full justify-between mb-4'):
-                    ui.label(
-                        f"Overall Score: {results['vignetting_score']:.1f}/100"
-                    ).classes('text-xl font-bold')
-                    ui.label(
-                        f"Analyzed: {photo_info['analysis']['analyzed_at']}"
-                    ).classes('text-gray-500')
+            dialog.open()
 
-                # Show visualization and metrics side by side
-                with ui.row().classes('gap-4'):
-                    # Left side - Visualization
+    def show_vignetting_results(self, analysis):
+        """Display vignetting analysis results"""
+        results = analysis.get('vignetting_results', {})
+        logging.info(f"Showing vignetting results with preview path: {analysis.get('preview_path')}")
+
+        # Show score and timestamp
+        with ui.row().classes('w-full justify-between mb-4'):
+            ui.label(
+                f"Vignetting Score: {results.get('vignetting_score', 0):.1f}/100"
+            ).classes('text-xl font-bold')
+            ui.label(
+                f"Analyzed: {analysis.get('analyzed_at', 'Unknown')}"
+            ).classes('text-gray-500')
+
+        # Show original and analyzed images side by side
+        with ui.row().classes('gap-4'):
+            # Left side - Original Image
+            with ui.card().classes('p-2'):
+                ui.label('Original Image').classes('font-bold mb-2')
+                preview_path = analysis.get('preview_path')
+
+                # Convert RAW to JPEG for display if needed
+                if preview_path and preview_path.lower().endswith(('.cr2', '.nef', '.arw')):
+                    jpeg_path = preview_path.rsplit('.', 1)[0] + '_preview.jpg'
+                    if not os.path.exists(jpeg_path):
+                        from analysis import convert_raw_to_jpeg
+                        convert_raw_to_jpeg(preview_path, jpeg_path)
+                    preview_path = jpeg_path
+
+                if preview_path and os.path.exists(preview_path):
+                    ui.image(preview_path).classes('max-w-xs')
+                else:
+                    ui.label('Preview not available').classes('text-red-500 italic')
+
+            # Right side - Intensity Map
+            with ui.card().classes('p-2'):
+                ui.label('Intensity Map').classes('font-bold mb-2')
+                if 'visualization_path' in analysis:
+                    ui.image(analysis['visualization_path']).classes('max-w-xs')
+                else:
+                    ui.label('Visualization not available').classes('text-red-500 italic')
+
+        # Corner measurements with colored values based on ratio
+        with ui.card().classes('p-4 mt-4'):
+            ui.label('Corner Measurements').classes('font-bold mb-2')
+            with ui.grid(columns=2).classes('gap-4'):
+                for corner, ratio in results.get('corner_ratios', {}).items():
                     with ui.card().classes('p-2'):
-                        ui.label('Intensity Map').classes('font-bold mb-2')
-                        if 'visualization_path' in photo_info['analysis']:
-                            ui.image(photo_info['analysis']['visualization_path'])
+                        ui.label(corner.replace('_', ' ').title())
+                        ui.label(f"{ratio:.2f}").classes(
+                            'font-bold text-lg ' +
+                            ('text-green-500' if ratio > 0.8 else
+                             'text-yellow-500' if ratio > 0.6 else
+                             'text-red-500')
+                        )
 
-                    # Right side - Metrics
-                    with ui.card().classes('p-4'):
-                        ui.label('Corner Measurements').classes('font-bold mb-2')
-                        # Show corner ratios in a grid
-                        with ui.grid(columns=2).classes('gap-4'):
-                            for corner, ratio in results['corner_ratios'].items():
-                                with ui.card().classes('p-2'):
-                                    ui.label(corner.replace('_', ' ').title())
-                                    ui.label(f"{ratio:.2f}").classes(
-                                        'font-bold text-lg ' +
-                                        ('text-green-500' if ratio > 0.8 else
-                                         'text-yellow-500' if ratio > 0.6 else
-                                         'text-red-500')
-                                    )
+            ui.label(f"Average corner ratio: {results.get('average_corner_ratio', 0):.2f}").classes('mt-4')
 
-                        ui.label(f"Average corner ratio: {results['average_corner_ratio']:.2f}").classes('mt-4')
+        # Analysis interpretation
+        with ui.card().classes('p-4 mt-4 bg-gray-50'):
+            ui.label('Analysis Interpretation').classes('font-bold mb-2')
+            score = results.get('vignetting_score', 0)
+            if score >= 80:
+                msg = "Excellent - Very minimal vignetting detected"
+            elif score >= 60:
+                msg = "Good - Some light falloff but within normal range"
+            else:
+                msg = "Significant vignetting detected"
+            ui.label(msg)
 
-                # Analysis interpretation
-                with ui.card().classes('p-4 mt-4 bg-gray-50'):
-                    ui.label('Analysis Interpretation').classes('font-bold mb-2')
-                    score = results['vignetting_score']
-                    if score >= 80:
-                        msg = "Excellent - Very minimal vignetting detected"
-                    elif score >= 60:
-                        msg = "Good - Some light falloff but within normal range"
-                    else:
-                        msg = "Significant vignetting detected"
-                    ui.label(msg)
+    def show_distortion_results(self, analysis):
+        """Display distortion analysis results"""
+        # Add logging
+        logging.info(f"Showing distortion results with preview path: {analysis.get('preview_path')}")
 
-            # Bottom buttons
-            with ui.row().classes('gap-2 justify-end mt-4'):
-                if 'analysis' in photo_info:
-                    ui.button(
-                        'Re-analyze',
-                        on_click=lambda: self.run_photo_analysis(scenario, photo_info, dialog)
-                    ).classes('bg-blue-500 text-white')
-                ui.button('Close', on_click=dialog.close).classes('bg-gray-500 text-white')
+        # Show score and timestamp
+        with ui.row().classes('w-full justify-between mb-4'):
+            ui.label(
+                f"Distortion Score: {analysis.get('distortion_score', 0):.1f}/100"
+            ).classes('text-xl font-bold')
+            ui.label(
+                f"Analyzed: {analysis.get('analyzed_at', 'Unknown')}"
+            ).classes('text-gray-500')
 
-        dialog.open()
+        # Show original and analyzed images side by side
+        with ui.row().classes('gap-4'):
+            # Left side - Original Image
+            with ui.card().classes('p-2'):
+                ui.label('Original Image').classes('font-bold mb-2')
+                preview_path = analysis.get('preview_path')
 
+                # Convert RAW to JPEG for display if needed
+                if preview_path and preview_path.lower().endswith(('.cr2', '.nef', '.arw')):
+                    jpeg_path = preview_path.rsplit('.', 1)[0] + '_preview.jpg'
+                    if not os.path.exists(jpeg_path):
+                        from analysis import convert_raw_to_jpeg
+                        convert_raw_to_jpeg(preview_path, jpeg_path)
+                    preview_path = jpeg_path
+
+                if preview_path and os.path.exists(preview_path):
+                    ui.image(preview_path).classes('max-w-xs')
+                else:
+                    ui.label('Preview not available').classes('text-red-500 italic')
+
+            # Right side - Detection Visualization
+            with ui.card().classes('p-2'):
+                ui.label('Grid Detection').classes('font-bold mb-2')
+                if 'visualization_path' in analysis and os.path.exists(analysis['visualization_path']):
+                    ui.image(analysis['visualization_path']).classes('max-w-xs')
+                else:
+                    ui.label('Visualization not available').classes('text-red-500 italic')
+
+        # Detailed metrics
+        with ui.card().classes('p-4 mt-4'):
+            ui.label('Detailed Measurements').classes('font-bold mb-2')
+            with ui.grid(columns=2).classes('gap-4'):
+                h_dev = analysis.get('horizontal_deviations', [])
+                v_dev = analysis.get('vertical_deviations', [])
+                ui.label(f"Number of Lines: {len(h_dev) + len(v_dev)}").classes('font-bold')
+                ui.label(f"Average Deviation: {analysis.get('average_deviation', 0):.2f} pixels")
+                ui.label(f"Horizontal Lines: {len(h_dev)}").classes('text-blue-500')
+                ui.label(f"Vertical Lines: {len(v_dev)}").classes('text-blue-500')
+
+        # Analysis interpretation
+        with ui.card().classes('p-4 mt-4 bg-gray-50'):
+            ui.label('Analysis Interpretation').classes('font-bold mb-2')
+            score = analysis.get('distortion_score', 0)
+            distortion_type = analysis.get('type', 'unknown')
+            if score >= 80:
+                msg = "Excellent - Minimal distortion detected"
+            elif score >= 60:
+                msg = f"Good - Some {distortion_type} distortion but within normal range"
+            else:
+                msg = f"Significant {distortion_type} distortion detected"
+            ui.label(msg)
+
+            if distortion_type == 'barrel':
+                ui.label("Barrel distortion: lines curve outward from center").classes('mt-2 text-sm text-gray-600')
+            elif distortion_type == 'pincushion':
+                ui.label("Pincushion distortion: lines curve inward toward center").classes(
+                    'mt-2 text-sm text-gray-600')
+
+    # ui.py
 
     def run_photo_analysis(self, scenario, photo_info, dialog=None):
-        """Run analysis on a photo"""
+        """Run analysis on a photo and save results"""
         try:
-            from analysis import analyze_scenario_photo  # Import at use time
+            from analysis import analyze_vignetting, analyze_distortion
 
-            if analyze_scenario_photo(scenario, photo_info):
-                ui.notify('Analysis complete', type='positive')
-                # Refresh the UI
+            if scenario['type'] == 'distortion':
+                results = analyze_distortion(photo_info['path'])
+                photo_info['analysis'] = {
+                    **results,
+                    'preview_path': photo_info['path'],
+                    'analyzed_at': datetime.now().strftime("%Y%m%d_%H%M%S"),
+                    'type': 'distortion'
+                }
+            elif scenario['type'] == 'vignette':
+                results = analyze_vignetting(photo_info['path'])
+                photo_info['analysis'] = {
+                    'vignetting_results': results,
+                    'visualization_path': results.get('visualization_path'),
+                    'preview_path': photo_info['path'],
+                    'analyzed_at': datetime.now().strftime("%Y%m%d_%H%M%S"),
+                    'type': 'vignette'
+                }
+
+            # Save updated scenario to dataset
+            if self.dataset_manager.update_scenario(
+                    self.current_dataset['id'],
+                    self.current_scenario
+            ):
+                ui.notification('Analysis complete', type='positive', position='bottom')
                 if dialog:
                     dialog.close()
+                # Refresh the UI
+                self.select_scenario(scenario)
+                # Show results
                 self.show_photo_analysis(scenario, photo_info)
             else:
-                ui.notify('Analysis failed', type='negative')
+                ui.notification('Analysis failed to save', type='negative', position='bottom')
+
         except Exception as e:
-            ui.notify(f'Error during analysis: {str(e)}', type='negative')
+            ui.notification(f'Error during analysis: {str(e)}', type='negative', position='bottom')
             logging.error(f"Analysis error: {e}")
+            if dialog:
+                dialog.close()
+
+
+    # ui.py
+
+    def delete_photo(self, scenario, photo_info):
+        """Delete a photo from a scenario"""
+        try:
+            # Show confirmation dialog
+            dialog = ui.dialog()
+            with dialog, ui.card().classes('p-4'):
+                ui.label('Confirm Delete').classes('text-xl mb-4')
+                ui.label('Are you sure you want to delete this photo?').classes('mb-4')
+
+                with ui.row().classes('gap-2 justify-end'):
+                    ui.button('Cancel', on_click=dialog.close).classes('bg-gray-500 text-white')
+                    ui.button(
+                        'Delete',
+                        on_click=lambda: self.perform_photo_delete(dialog, scenario, photo_info)
+                    ).classes('bg-red-500 text-white')
+
+            dialog.open()
+
+        except Exception as e:
+            ui.notify(f'Error showing delete dialog: {str(e)}', type='negative')
+            logging.error(f"Error in delete_photo: {e}")
+
+    def perform_photo_delete(self, dialog, scenario, photo_info):
+        """Actually perform the photo deletion after confirmation"""
+        try:
+            # Close the dialog first
+            dialog.close()
+
+            # Remove physical file
+            if 'path' in photo_info and os.path.exists(photo_info['path']):
+                os.remove(photo_info['path'])
+
+            # Remove visualization file if it exists
+            if 'analysis' in photo_info:
+                viz_path = photo_info['analysis'].get('visualization_path')
+                if viz_path and os.path.exists(viz_path):
+                    os.remove(viz_path)
+
+            # Remove from scenario's photos list
+            scenario['photos'] = [p for p in scenario['photos'] if p['filename'] != photo_info['filename']]
+
+            # Update scenario in dataset
+            if self.dataset_manager.update_scenario(
+                    self.current_dataset['id'],
+                    scenario
+            ):
+                ui.notify('Photo deleted successfully', type='positive')
+                # Refresh the scenario view
+                self.select_scenario(scenario)
+            else:
+                ui.notify('Failed to update scenario after delete', type='negative')
+
+        except Exception as e:
+            ui.notify(f'Error deleting photo: {str(e)}', type='negative')
+            logging.error(f"Error in perform_photo_delete: {e}")
 
 
     def run(self):
         """Start the UI"""
         self.create_main_page()
         ui.run()
-

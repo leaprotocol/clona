@@ -1,12 +1,125 @@
-# analysis.py
-
 import cv2
 import numpy as np
 import logging
-from datetime import datetime
 import rawpy
+from datetime import datetime
 import os
 
+
+def calculate_line_deviations(lines):
+    """Calculate how much lines deviate from being straight"""
+    if not lines:
+        return np.array([])
+
+    deviations = []
+    for line in lines:
+        x1, y1, x2, y2 = line
+        length = np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+        points = np.linspace(0, length, 20)
+        ideal_y = np.linspace(y1, y2, 20)
+        actual_y = points * (y2 - y1) / length + y1
+        deviation = np.mean(np.abs(actual_y - ideal_y))
+        deviations.append(deviation)
+
+    return np.array(deviations)
+
+
+def analyze_distortion(image_path):
+    """Analyze lens distortion using a grid chart image"""
+    logging.info(f"Starting distortion analysis of image: {image_path}")
+
+    try:
+        # Load and preprocess image
+        if image_path.lower().endswith(('.cr2', '.nef', '.arw')):
+            with rawpy.imread(image_path) as raw:
+                img = raw.postprocess(
+                    use_camera_wb=True,
+                    half_size=True,
+                    no_auto_bright=True,
+                    output_bps=8
+                )
+                img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        else:
+            img = cv2.imread(image_path)
+
+        if img is None:
+            raise ValueError("Failed to load image")
+
+        # Convert to grayscale
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+        # Apply threshold
+        _, binary = cv2.threshold(gray, 128, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+        # Detect lines
+        lines = cv2.HoughLinesP(
+            255 - binary,
+            rho=1,
+            theta=np.pi / 180,
+            threshold=100,
+            minLineLength=100,
+            maxLineGap=10
+        )
+
+        if lines is None:
+            raise ValueError("No lines detected in grid")
+
+        # Separate horizontal and vertical lines
+        h_lines = []
+        v_lines = []
+
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            angle = abs(np.arctan2(y2 - y1, x2 - x1) * 180 / np.pi)
+            if angle < 45:  # Horizontal
+                h_lines.append((x1, y1, x2, y2))
+            elif angle > 45:  # Vertical
+                v_lines.append((x1, y1, x2, y2))
+
+        # Calculate deviations
+        h_deviations = calculate_line_deviations(h_lines)
+        v_deviations = calculate_line_deviations(v_lines)
+
+        # Create visualization
+        viz_img = img.copy()
+
+        # Draw detected lines
+        for x1, y1, x2, y2 in h_lines:
+            cv2.line(viz_img, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        for x1, y1, x2, y2 in v_lines:
+            cv2.line(viz_img, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+        # Calculate metrics
+        h_dev = np.mean(h_deviations) if len(h_deviations) > 0 else 0
+        v_dev = np.mean(v_deviations) if len(v_deviations) > 0 else 0
+        avg_deviation = (h_dev + v_dev) / 2 if (len(h_deviations) > 0 or len(v_deviations) > 0) else 0
+
+        # Calculate distortion score (0-100, higher is better)
+        distortion_score = 100 * (1 - min(avg_deviation / 50, 1))
+
+        # Save visualization
+        viz_path = os.path.join(
+            os.path.dirname(image_path),
+            f"distortion_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+        )
+        cv2.imwrite(viz_path, viz_img)
+
+        results = {
+            'horizontal_deviations': h_deviations.tolist(),
+            'vertical_deviations': v_deviations.tolist(),
+            'average_deviation': float(avg_deviation),
+            'distortion_score': float(distortion_score),
+            'visualization_path': viz_path,
+            'type': 'barrel' if avg_deviation > 0 else 'pincushion',
+            'analysis_time': datetime.now().strftime("%Y%m%d_%H%M%S")
+        }
+
+        logging.info(f"Analysis complete. Score: {distortion_score:.2f}")
+        return results
+
+    except Exception as e:
+        logging.error(f"Distortion analysis failed: {str(e)}")
+        raise
 
 def analyze_vignetting(image_path):
     """Analyze vignetting in an image
@@ -89,14 +202,21 @@ def analyze_vignetting(image_path):
         vignetting_score = avg_corner_ratio * 100
 
         logging.info(f"Analysis complete - score: {vignetting_score:.2f}")
+        viz_path = os.path.join(
+            os.path.dirname(image_path),
+            f"vignette_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+        )
+        create_vignetting_visualization(image_path, viz_path)
 
         return {
             'center_intensity': float(center_intensity),
             'corner_intensities': {k: float(v) for k, v in corner_intensities.items()},
             'corner_ratios': {k: float(v) for k, v in corner_ratios.items()},
             'average_corner_ratio': float(avg_corner_ratio),
-            'vignetting_score': float(vignetting_score)
+            'vignetting_score': float(vignetting_score),
+            'visualization_path': viz_path  # Make sure this is included
         }
+
 
     except Exception as e:
         logging.error(f"Analysis failed: {str(e)}")
@@ -169,6 +289,23 @@ def create_vignetting_visualization(image_path, output_path):
         logging.error(f"Visualization failed: {str(e)}")
         raise
 
+def convert_raw_to_jpeg(raw_path, jpeg_path):
+    """Convert RAW image to JPEG for viewing"""
+    try:
+        with rawpy.imread(raw_path) as raw:
+            rgb = raw.postprocess(
+                use_camera_wb=True,
+                no_auto_bright=True,
+                output_bps=8
+            )
+            # Convert from RGB to BGR for OpenCV
+            bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+            cv2.imwrite(jpeg_path, bgr)
+            return True
+    except Exception as e:
+        logging.error(f"Error converting RAW to JPEG: {e}")
+        return False
+
 
 def analyze_scenario_photo(scenario, photo_info):
     """Analyze a single photo from a scenario"""
@@ -181,6 +318,11 @@ def analyze_scenario_photo(scenario, photo_info):
         # Create output paths
         base_path = photo_path.rsplit('.', 1)[0]
         viz_path = f"{base_path}_analysis.jpg"
+        preview_path = f"{base_path}_preview.jpg"
+
+        # Convert RAW to JPEG for viewing
+        if photo_path.lower().endswith(('.cr2', '.nef', '.arw')):
+            convert_raw_to_jpeg(photo_path, preview_path)
 
         # Run analysis
         results = analyze_vignetting(photo_path)
@@ -192,6 +334,7 @@ def analyze_scenario_photo(scenario, photo_info):
         photo_info['analysis'] = {
             'vignetting_results': results,
             'visualization_path': viz_path,
+            'preview_path': preview_path if photo_path.lower().endswith(('.cr2', '.nef', '.arw')) else photo_path,
             'analyzed_at': datetime.now().strftime("%Y%m%d_%H%M%S")
         }
 
@@ -200,3 +343,5 @@ def analyze_scenario_photo(scenario, photo_info):
     except Exception as e:
         logging.error(f"Error analyzing photo {photo_path}: {e}")
         return False
+
+
