@@ -345,3 +345,351 @@ def analyze_scenario_photo(scenario, photo_info):
         return False
 
 
+def analyze_bokeh(image_path, click_x, click_y, metadata=None):
+    """
+    Analyze bokeh from a single clicked point
+
+    Args:
+        image_path: Path to image file
+        click_x, click_y: Coordinates where user clicked
+
+    Returns:
+        Dictionary containing analysis results and visualizations
+    """
+    logging.info(f"Starting bokeh analysis at point ({click_x}, {click_y})")
+
+    try:
+        # Load and process image
+        if image_path.lower().endswith(('.cr2', '.nef', '.arw')):
+            with rawpy.imread(image_path) as raw:
+                img = raw.postprocess(
+                    use_camera_wb=True,
+                    half_size=True,
+                    no_auto_bright=True,
+                    output_bps=8
+                )
+                img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        else:
+            img = cv2.imread(image_path)
+
+        # Auto-detect bokeh region
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (15, 15), 0)
+
+        # Use adaptive thresholding to isolate bright regions
+        thresh = cv2.adaptiveThreshold(
+            blurred, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            21, -2
+        )
+
+        # Find contours around bright regions
+        contours, _ = cv2.findContours(
+            thresh,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE
+        )
+
+        # Find contour closest to click point
+        min_dist = float('inf')
+        bokeh_contour = None
+
+        for contour in contours:
+            M = cv2.moments(contour)
+            if M["m00"] != 0:
+                cx = int(M["m10"] / M["m00"])
+                cy = int(M["m01"] / M["m00"])
+                dist = np.sqrt((cx - click_x) ** 2 + (cy - click_y) ** 2)
+                if dist < min_dist:
+                    min_dist = dist
+                    bokeh_contour = contour
+
+        if bokeh_contour is None:
+            raise ValueError("Could not detect bokeh region near click point")
+
+        # Get enclosing circle
+        (center_x, center_y), radius = cv2.minEnclosingCircle(bokeh_contour)
+        center_x, center_y = int(center_x), int(center_y)
+        radius = int(radius)
+
+        # Extract ROI
+        roi_size = int(radius * 2.5)
+        roi_x1 = max(0, center_x - roi_size)
+        roi_x2 = min(img.shape[1], center_x + roi_size)
+        roi_y1 = max(0, center_y - roi_size)
+        roi_y2 = min(img.shape[0], center_y + roi_size)
+
+        roi = img[roi_y1:roi_y2, roi_x1:roi_x2]
+
+        # 1. Analyze Shape Regularity
+        regularity_score, shape_metrics = analyze_shape_regularity(
+            bokeh_contour, radius
+        )
+
+        # 2. Analyze Color Fringing
+        fringing_score, color_metrics = analyze_color_fringing(
+            roi,
+            (center_x - roi_x1, center_y - roi_y1),
+            radius
+        )
+
+        # 3. Analyze Intensity Distribution
+        intensity_score, intensity_metrics = analyze_intensity_distribution(
+            roi,
+            (center_x - roi_x1, center_y - roi_y1),
+            radius
+        )
+
+        # Create visualization
+        viz_path = os.path.join(
+            os.path.dirname(image_path),
+            f"bokeh_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+        )
+        create_bokeh_visualization(
+            roi,
+            (center_x - roi_x1, center_y - roi_y1),
+            radius,
+            shape_metrics,
+            color_metrics,
+            intensity_metrics,
+            viz_path,
+            metadata
+        )
+
+
+        # Convert numpy values to Python native types in metrics
+        shape_metrics = {
+            'circularity': float(shape_metrics['circularity']),
+            'contour_matching': float(shape_metrics['contour_matching']),
+            # This was wrong before - it's 'contour_matching' not 'matching_score'
+            'area': float(shape_metrics['area']),
+            'perimeter': float(shape_metrics['perimeter'])
+        }
+
+        color_metrics = {
+            'average_color_difference': float(color_metrics['average_color_difference']),
+            'max_color_difference': float(color_metrics['max_color_difference']),
+            'color_variation': float(color_metrics['color_variation'])
+        }
+
+        intensity_metrics = {
+            'mean_intensity': float(intensity_metrics['mean_intensity']),
+            'std_intensity': float(intensity_metrics['std_intensity']),
+            'intensity_gradient': float(intensity_metrics['intensity_gradient']),
+            'center_intensity': float(intensity_metrics['center_intensity'])
+        }
+
+        results = {
+            'overall_score': float((regularity_score + fringing_score + intensity_score) / 3),
+            'shape_regularity': {
+                'score': float(regularity_score),
+                'metrics': shape_metrics
+            },
+            'color_fringing': {
+                'score': float(fringing_score),
+                'metrics': color_metrics
+            },
+            'intensity_distribution': {
+                'score': float(intensity_score),
+                'metrics': intensity_metrics
+            },
+            'visualization_path': viz_path,
+            'center_point': (float(center_x), float(center_y)),
+            'radius': float(radius),
+            'analysis_time': datetime.now().strftime("%Y%m%d_%H%M%S"),
+            'metadata': metadata or {}  # Include the metadata in results
+        }
+
+        return results
+
+
+
+    except Exception as e:
+        logging.error(f"Bokeh analysis failed: {str(e)}")
+        raise
+
+
+def analyze_shape_regularity(contour, radius):
+    """Analyze how circular/regular the bokeh shape is"""
+    # Calculate circularity
+    area = cv2.contourArea(contour)
+    perimeter = cv2.arcLength(contour, True)
+    circularity = 4 * np.pi * area / (perimeter * perimeter)
+
+    # Calculate contour regularity
+    ideal_circle = np.zeros((int(radius * 2.5), int(radius * 2.5)), dtype=np.uint8)
+    cv2.circle(
+        ideal_circle,
+        (int(radius * 1.25), int(radius * 1.25)),
+        radius,
+        255,
+        -1
+    )
+
+    # Compare with ideal circle
+    matching_score = cv2.matchShapes(
+        contour,
+        cv2.findContours(ideal_circle, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0][0],
+        cv2.CONTOURS_MATCH_I2,
+        0.0
+    )
+
+    # Calculate score (0-100)
+    regularity_score = (circularity * 50 + (1 - matching_score) * 50)
+
+    metrics = {
+        'circularity': circularity,
+        'contour_matching': matching_score,
+        'area': area,
+        'perimeter': perimeter
+    }
+
+    return regularity_score, metrics
+
+
+def analyze_color_fringing(roi, center, radius):
+    """Analyze color fringing/chromatic aberration in bokeh"""
+    center_x, center_y = center
+
+    # Split into color channels
+    b, g, r = cv2.split(roi)
+
+    # Create circular mask
+    mask = np.zeros(roi.shape[:2], dtype=np.uint8)
+    cv2.circle(mask, (center_x, center_y), radius, 255, -1)
+
+    # Calculate color channel differences along radius
+    angles = np.linspace(0, 2 * np.pi, 360)
+    color_diffs = []
+
+    for angle in angles:
+        points = []
+        for i in range(radius):
+            x = int(center_x + i * np.cos(angle))
+            y = int(center_y + i * np.sin(angle))
+            if 0 <= x < roi.shape[1] and 0 <= y < roi.shape[0]:
+                points.append((r[y, x], g[y, x], b[y, x]))
+
+        if points:
+            points = np.array(points)
+            # Calculate max difference between channels
+            channel_diffs = np.max(points, axis=1) - np.min(points, axis=1)
+            color_diffs.append(np.mean(channel_diffs))
+
+    avg_color_diff = np.mean(color_diffs)
+    max_color_diff = np.max(color_diffs)
+
+    # Calculate score (0-100, lower color difference is better)
+    fringing_score = 100 * (1 - min(avg_color_diff / 255, 1.0))
+
+    metrics = {
+        'average_color_difference': avg_color_diff,
+        'max_color_difference': max_color_diff,
+        'color_variation': np.std(color_diffs)
+    }
+
+    return fringing_score, metrics
+
+
+def analyze_intensity_distribution(roi, center, radius):
+    """Analyze the intensity distribution within bokeh"""
+    center_x, center_y = center
+
+    # Convert to grayscale
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+
+    # Create circular mask
+    mask = np.zeros_like(gray)
+    cv2.circle(mask, (center_x, center_y), radius, 255, -1)
+
+    # Get masked region
+    masked = cv2.bitwise_and(gray, gray, mask=mask)
+
+    # Calculate intensity metrics
+    non_zero = masked[masked > 0]
+    if len(non_zero) == 0:
+        return 0, {}
+
+    mean_intensity = np.mean(non_zero)
+    std_intensity = np.std(non_zero)
+
+    # Calculate radial intensity profile
+    distances = []
+    intensities = []
+
+    y_indices, x_indices = np.nonzero(mask)
+    for y, x in zip(y_indices, x_indices):
+        dist = np.sqrt((x - center_x) ** 2 + (y - center_y) ** 2)
+        distances.append(dist)
+        intensities.append(gray[y, x])
+
+    # Sort by distance
+    sorted_indices = np.argsort(distances)
+    distances = np.array(distances)[sorted_indices]
+    intensities = np.array(intensities)[sorted_indices]
+
+    # Calculate intensity falloff
+    if len(distances) > 0:
+        intensity_gradient = np.polyfit(distances, intensities, 1)[0]
+    else:
+        intensity_gradient = 0
+
+    # Calculate score based on:
+    # 1. Intensity uniformity (higher std = lower score)
+    # 2. Gradual falloff (very negative gradient = lower score)
+    uniformity_score = 100 * (1 - min(std_intensity / mean_intensity, 1.0))
+    falloff_score = 100 * (1 - min(abs(intensity_gradient) / 2.0, 1.0))
+
+    intensity_score = (uniformity_score + falloff_score) / 2
+
+    metrics = {
+        'mean_intensity': mean_intensity,
+        'std_intensity': std_intensity,
+        'intensity_gradient': intensity_gradient,
+        'center_intensity': gray[center_y, center_x]
+    }
+
+    return intensity_score, metrics
+
+
+
+def create_bokeh_visualization(roi, center, radius, shape_metrics, color_metrics,
+                             intensity_metrics, output_path, metadata=None):
+    """Create visualization of bokeh analysis"""
+    viz = roi.copy()
+    center_x, center_y = center
+
+    # Draw detected circle
+    cv2.circle(viz, (center_x, center_y), radius, (0, 255, 0), 2)
+
+    # Add metric annotations
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    y = 30
+
+    # Add camera settings if available
+    if metadata:
+        settings = []
+        if 'aperture' in metadata:
+            settings.append(f"f/{metadata['aperture']}")
+        if 'shutter_speed' in metadata:
+            settings.append(f"1/{metadata['shutter_speed']}s")
+        if 'iso' in metadata:
+            settings.append(f"ISO {metadata['iso']}")
+
+        settings_text = " • ".join(settings)
+        cv2.putText(viz, settings_text, (10, y), font, 0.6, (255, 255, 255), 2)
+        y += 25
+
+    # Rest of the visualization code remains the same...
+
+    cv2.putText(viz, f"Circularity: {shape_metrics['circularity']:.2f}",
+                (10, y), font, 0.5, (255, 255, 255), 2)
+    y += 20
+    cv2.putText(viz, f"Color Fringing: {color_metrics['average_color_difference']:.2f}",
+                (10, y), font, 0.5, (255, 255, 255), 2)
+    y += 20
+    cv2.putText(viz, f"Intensity Std: {intensity_metrics['std_intensity']:.2f}",
+                (10, y), font, 0.5, (255, 255, 255), 2)
+
+    cv2.imwrite(output_path, viz)

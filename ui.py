@@ -6,7 +6,8 @@ from typing import Callable
 from datetime import datetime
 import gphoto2 as gp  # Add this import
 import shutil
-
+import cv2
+from analysis import analyze_bokeh
 
 class LensAnalysisUI:
     def __init__(self, camera_manager, dataset_manager):
@@ -90,13 +91,11 @@ class LensAnalysisUI:
             ui.notify('Please select a scenario first', type='warning')
             return
 
-        # For vignette scenario, ask for aperture setting first
-        if self.current_scenario['type'] == 'vignette':
+        # Show aperture selection for both vignette and bokeh scenarios
+        if self.current_scenario['type'] in ['vignette', 'bokeh']:
             self.show_aperture_selection_dialog()
-        elif self.current_scenario['type'] == 'distortion':
-            self.do_capture()  # Regular capture for distortion
         else:
-            self.do_capture()  # Regular capture for other scenarios
+            self.do_capture()
 
     def show_aperture_selection_dialog(self):
         """Show dialog for selecting multiple apertures for batch capture"""
@@ -142,56 +141,6 @@ class LensAnalysisUI:
         dialog.on_click_outside = close_dialog
 
         dialog.open()
-
-    def do_capture_with_aperture(self, dialog, aperture):
-        """Capture photo with the selected aperture value"""
-        dialog.close()
-
-        # Ensure captures directory exists
-        os.makedirs("captures", exist_ok=True)
-
-        ui.notify('Capturing photo...', type='ongoing')
-
-        # Try capture with retries
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                path = self.camera_manager.capture_image("captures")
-                if path:
-                    # Add photo to scenario with metadata
-                    photo_info = {
-                        'filename': os.path.basename(path),
-                        'path': path,
-                        'timestamp': datetime.now().strftime("%Y%m%d_%H%M%S"),
-                        'metadata': {
-                            'aperture': aperture
-                        }
-                    }
-
-                    if 'photos' not in self.current_scenario:
-                        self.current_scenario['photos'] = []
-                    self.current_scenario['photos'].append(photo_info)
-
-                    # Update UI
-                    self.select_scenario(self.current_scenario)
-                    ui.notify(f'Photo captured at {aperture}', type='positive')
-                    return
-                else:
-                    if attempt < max_retries - 1:
-                        logging.warning(f"Capture attempt {attempt + 1} failed, retrying...")
-                        time.sleep(2)  # Wait before retry
-                    else:
-                        ui.notify('Failed to capture photo after multiple attempts', type='negative')
-
-            except Exception as e:
-                if attempt < max_retries - 1:
-                    logging.error(f"Error on capture attempt {attempt + 1}: {e}")
-                    time.sleep(2)  # Wait before retry
-                else:
-                    ui.notify(f'Error capturing photo: {str(e)}', type='negative')
-                    logging.error(f"Error capturing photo: {e}")
-
-    # ui.py
 
     def do_capture(self):
         """Regular capture without aperture metadata"""
@@ -331,8 +280,8 @@ class LensAnalysisUI:
                 label='Scenario Type',
                 options=[
                     ('vignette', 'Vignetting Test'),
-                    ('distortion', 'Distortion Analysis'),  # Make sure this matches exactly
-                    ('bokeh', 'Bokeh Analysis'),
+                    ('distortion', 'Distortion Analysis'),
+                    ('bokeh', 'Bokeh Analysis'),  # Added this option
                     ('sharpness', 'Sharpness Test')
                 ]
             ).classes('w-full mb-4')
@@ -432,6 +381,7 @@ class LensAnalysisUI:
 
         self.refresh_dataset_list()
 
+
     def select_scenario(self, scenario):
         """Select and display a scenario"""
         self.current_scenario = scenario
@@ -460,6 +410,39 @@ class LensAnalysisUI:
                                 ui.label(f"Filename: {photo['filename']}").classes('font-bold')
                                 ui.label(f"Taken: {photo['timestamp']}")
 
+                                # Display photo with click handler for bokeh analysis
+                                if scenario['type'] == 'bokeh':
+                                    preview_path = photo['path']
+                                    # Convert RAW to JPEG for viewing if needed
+                                    if preview_path.lower().endswith(('.cr2', '.nef', '.arw')):
+                                        jpg_path = preview_path.rsplit('.', 1)[0] + '_preview.jpg'
+                                        if not os.path.exists(jpg_path):
+                                            from analysis import convert_raw_to_jpeg
+                                            convert_raw_to_jpeg(preview_path, jpg_path)
+                                        preview_path = jpg_path
+
+                                    # Create a container for the image
+                                    with ui.card().classes('relative'):
+                                        img = ui.image(preview_path).classes('cursor-pointer max-w-full')
+                                        img.on("click", lambda e, s=scenario, p=photo:self.handle_bokeh_click(e, s, p))
+                                        # Create a clickable overlay
+                                        #with ui.element('div').classes('absolute inset-0'):
+                                        #    ui.button('', on_click=lambda e, s=scenario, p=photo:
+                                        #    self.handle_bokeh_click(e, s, p)).classes(
+                                        #        'w-full h-full bg-transparent')
+                                        ui.label('Click on the bokeh circle to analyze').classes(
+                                            'text-sm text-gray-500')
+                                else:
+                                    # Regular image display for non-bokeh scenarios
+                                    preview_path = photo['path']
+                                    if preview_path.lower().endswith(('.cr2', '.nef', '.arw')):
+                                        jpg_path = preview_path.rsplit('.', 1)[0] + '_preview.jpg'
+                                        if not os.path.exists(jpg_path):
+                                            from analysis import convert_raw_to_jpeg
+                                            convert_raw_to_jpeg(preview_path, jpg_path)
+                                        preview_path = jpg_path
+                                    ui.image(preview_path).classes('max-w-full')
+
                                 with ui.row().classes('gap-2 mt-2'):
                                     if scenario['type'] == 'distortion':
                                         ui.button(
@@ -471,6 +454,9 @@ class LensAnalysisUI:
                                             'Analyze Vignette',
                                             on_click=lambda p=photo: self.run_photo_analysis(scenario, p)
                                         ).classes('bg-blue-500 text-white p-2')
+                                    elif scenario['type'] == 'bokeh':
+                                        if 'analysis' not in photo:
+                                            ui.label('Click image to analyze bokeh').classes('text-sm text-gray-500')
 
                                     if 'analysis' in photo:
                                         ui.button(
@@ -498,9 +484,15 @@ class LensAnalysisUI:
                             on_click=self.handle_capture_photo
                         ).classes('bg-green-500 text-white')
 
+                if scenario['type'] == 'bokeh':
+                    with ui.card().classes('mt-4 p-2 bg-gray-50'):
+                        ui.label('Bokeh Analysis Instructions:').classes('font-bold')
+                        ui.label('1. Take a photo of a defocused point light source')
+                        ui.label('2. Click on the bokeh circle in the image to analyze')
+                        ui.label('3. Analysis will measure shape, color fringing, and intensity distribution')
+
             # For debugging - show current scenario state
             logging.debug(f"Current scenario state: {scenario}")
-
     def refresh_dataset_list(self):
         """Refresh the dataset list display"""
         self.dataset_list.clear()
@@ -676,37 +668,6 @@ class LensAnalysisUI:
         self.select_scenario(self.current_scenario)
         ui.notify('Batch capture complete', type='positive')
 
-    def do_capture_confirmed(self, dialog, aperture):
-        """Execute single capture after user confirms aperture is set"""
-        dialog.close()
-
-        ui.notify(f'Capturing photo at {aperture}...', type='ongoing')
-
-        try:
-            path = self.camera_manager.capture_image("captures")
-            if path:
-                # Add photo to scenario with metadata
-                photo_info = {
-                    'filename': os.path.basename(path),
-                    'path': path,
-                    'timestamp': datetime.now().strftime("%Y%m%d_%H%M%S"),
-                    'metadata': {
-                        'aperture': aperture
-                    }
-                }
-
-                if 'photos' not in self.current_scenario:
-                    self.current_scenario['photos'] = []
-                self.current_scenario['photos'].append(photo_info)
-
-                # Update UI
-                self.select_scenario(self.current_scenario)
-                ui.notify(f'Photo captured at {aperture}', type='positive')
-            else:
-                ui.notify('Failed to capture photo', type='negative')
-        except Exception as e:
-            ui.notify(f'Error capturing photo: {str(e)}', type='negative')
-            logging.error(f"Error capturing photo: {e}")
 
     def print_available_apertures(self):
         """Print available aperture settings for the camera"""
@@ -731,34 +692,156 @@ class LensAnalysisUI:
 
     def show_photo_analysis(self, scenario, photo_info):
         """Show analysis dialog for a photo"""
-        # Add logging
-        logging.info(f"Showing analysis for photo: {photo_info['path']}")
-        logging.info(f"Analysis data: {photo_info.get('analysis')}")
-
         dialog = ui.dialog()
         with dialog, ui.card().classes('p-4 min-w-[800px]'):
             with ui.row().classes('w-full justify-between items-center'):
-                title = 'Distortion Analysis Results' if scenario[
-                                                             'type'] == 'distortion' else 'Vignetting Analysis Results'
+                title = {
+                    'distortion': 'Distortion Analysis Results',
+                    'vignette': 'Vignetting Analysis Results',
+                    'bokeh': 'Bokeh Analysis Results'
+                }.get(scenario['type'], 'Analysis Results')
+
                 ui.label(title).classes('text-xl')
                 ui.button(text='✕', on_click=dialog.close).classes('text-gray-500')
 
             if 'analysis' not in photo_info:
                 with ui.column().classes('gap-4 items-center'):
                     ui.label('No analysis results available').classes('text-gray-500 italic')
-                    ui.button(
-                        'Analyze Now',
-                        on_click=lambda: self.run_photo_analysis(scenario, photo_info, dialog)
-                    ).classes('bg-blue-500 text-white')
+                    if scenario['type'] == 'bokeh':
+                        ui.label('Click on the image to analyze bokeh').classes('text-sm')
+                    else:
+                        ui.button(
+                            'Analyze Now',
+                            on_click=lambda: self.run_photo_analysis(scenario, photo_info, dialog)
+                        ).classes('bg-blue-500 text-white')
             else:
                 if scenario['type'] == 'distortion':
-                    # Access results directly as they're not nested
                     self.show_distortion_results(photo_info['analysis'])
                 elif scenario['type'] == 'vignette':
-                    # Access vignetting results which are nested
                     self.show_vignetting_results(photo_info['analysis'])
+                elif scenario['type'] == 'bokeh':
+                    self.show_bokeh_results(photo_info['analysis'])
 
             dialog.open()
+
+    def show_bokeh_results(self, analysis):
+        """Display bokeh analysis results"""
+        logging.info(f"Showing bokeh results with metadata: {analysis.get('metadata', {})}")
+
+        # Show scores and metadata
+        with ui.row().classes('w-full justify-between mb-4'):
+            ui.label(
+                f"Overall Score: {analysis.get('overall_score', 0):.1f}/100"
+            ).classes('text-xl font-bold')
+
+        # Show camera settings
+        with ui.card().classes('w-full p-4 mb-4 bg-gray-50'):
+            with ui.row().classes('gap-4 justify-start'):
+                metadata = analysis.get('metadata', {})
+                logging.info(f"Displaying camera settings from metadata: {metadata}")
+
+                if 'aperture' in metadata:
+                    ui.label(f"f/{metadata['aperture']}").classes('font-mono')
+                if 'shutter_speed' in metadata:
+                    ui.label(f"1/{metadata['shutter_speed']}s").classes('font-mono')
+                if 'iso' in metadata:
+                    ui.label(f"ISO {metadata['iso']}").classes('font-mono')
+
+        # Show original and analyzed images side by side
+        with ui.row().classes('gap-4'):
+            # Original Image
+            with ui.card().classes('p-2'):
+                ui.label('Original Image').classes('font-bold mb-2')
+                preview_path = analysis.get('preview_path')
+
+                # Convert RAW to JPEG for display if needed
+                if preview_path and preview_path.lower().endswith(('.cr2', '.nef', '.arw')):
+                    jpeg_path = preview_path.rsplit('.', 1)[0] + '_preview.jpg'
+                    if not os.path.exists(jpeg_path):
+                        from analysis import convert_raw_to_jpeg
+                        convert_raw_to_jpeg(preview_path, jpeg_path)
+                    preview_path = jpeg_path
+
+                if preview_path and os.path.exists(preview_path):
+                    ui.image(preview_path).classes('max-w-xs')
+                else:
+                    ui.label('Preview not available').classes('text-red-500 italic')
+
+            # Analysis Visualization
+            with ui.card().classes('p-2'):
+                ui.label('Analysis').classes('font-bold mb-2')
+                if 'visualization_path' in analysis:
+                    ui.image(analysis['visualization_path']).classes('max-w-xs')
+                else:
+                    ui.label('Visualization not available').classes('text-red-500 italic')
+
+
+            # Show detailed metrics
+            with ui.grid(columns=3).classes('gap-4 mt-4'):
+                # Shape regularity metrics
+                with ui.card().classes('p-4'):
+                    ui.label('Shape Regularity').classes('font-bold mb-2')
+                    shape_metrics = analysis.get('shape_regularity', {}).get('metrics', {})
+                    ui.label(f"Score: {analysis.get('shape_regularity', {}).get('score', 0):.1f}/100")
+                    ui.label(f"Circularity: {shape_metrics.get('circularity', 0):.3f}")
+
+                # Color fringing metrics
+                with ui.card().classes('p-4'):
+                    ui.label('Color Fringing').classes('font-bold mb-2')
+                    color_metrics = analysis.get('color_fringing', {}).get('metrics', {})
+                    ui.label(f"Score: {analysis.get('color_fringing', {}).get('score', 0):.1f}/100")
+                    ui.label(f"Avg Difference: {color_metrics.get('average_color_difference', 0):.1f}")
+
+                # Intensity metrics
+                with ui.card().classes('p-4'):
+                    ui.label('Intensity Distribution').classes('font-bold mb-2')
+                    intensity_metrics = analysis.get('intensity_distribution', {}).get('metrics', {})
+                    ui.label(f"Score: {analysis.get('intensity_distribution', {}).get('score', 0):.1f}/100")
+                    ui.label(f"Uniformity: {intensity_metrics.get('std_intensity', 0):.1f}")
+
+
+
+    def handle_bokeh_click(self, event, scenario, photo_info):
+        """Handle click on photo for bokeh analysis"""
+        try:
+            click_x = event.args.get("offsetX", 0)
+            click_y = event.args.get("offsetY", 0)
+
+            logging.info(f"Processing bokeh click at coordinates: ({click_x}, {click_y})")
+            logging.info(f"Photo info received: {photo_info}")
+            logging.info(f"Photo metadata: {photo_info.get('metadata', {})}")
+
+            ui.notify('Starting bokeh analysis...', type='info')
+
+            metadata = photo_info.get('metadata', {})
+            results = analyze_bokeh(photo_info['path'], click_x, click_y, metadata)
+
+            logging.info(f"Analysis results metadata: {results.get('metadata', {})}")
+
+            # Store results
+            photo_info['analysis'] = {
+                **results,
+                'preview_path': photo_info['path'],
+                'analyzed_at': datetime.now().strftime("%Y%m%d_%H%M%S"),
+                'type': 'bokeh'
+            }
+
+            logging.info(f"Final analysis stored: {photo_info['analysis'].get('metadata', {})}")
+
+            # Save updated scenario
+            if self.dataset_manager.update_scenario(
+                    self.current_dataset['id'],
+                    scenario
+            ):
+                ui.notify('Bokeh analysis complete', type='positive')
+                self.select_scenario(scenario)
+                self.show_photo_analysis(scenario, photo_info)
+            else:
+                ui.notify('Failed to save analysis results', type='negative')
+
+        except Exception as e:
+            ui.notify(f'Error during bokeh analysis: {str(e)}', type='negative')
+            logging.error(f"Bokeh analysis error: {e}")
 
     def show_vignetting_results(self, analysis):
         """Display vignetting analysis results"""
