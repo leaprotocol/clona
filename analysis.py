@@ -4,7 +4,142 @@ import logging
 import rawpy
 from datetime import datetime
 import os
+import matplotlib.pyplot as plt
 
+
+
+def analyze_sharpness(image_path):
+    """Analyze image sharpness using edge detection and MTF calculations"""
+    logging.info(f"Starting sharpness analysis of image: {image_path}")
+
+    try:
+        # Load and preprocess image
+        if image_path.lower().endswith(('.cr2', '.nef', '.arw')):
+            with rawpy.imread(image_path) as raw:
+                img = raw.postprocess(
+                    use_camera_wb=True,
+                    half_size=True,
+                    no_auto_bright=True,
+                    output_bps=8
+                )
+                img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        else:
+            img = cv2.imread(image_path)
+
+        if img is None:
+            raise ValueError("Failed to load image")
+
+        # Convert to grayscale
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+        # Calculate edge response
+        edges = cv2.Canny(gray, 50, 150)
+
+        # Calculate local variance as a measure of detail retention
+        kernel_size = 5
+        local_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+
+        # Calculate MTF (Modulation Transfer Function)
+        mtf_values = calculate_mtf(gray)
+
+        # Calculate overall sharpness metrics
+        edge_intensity = np.mean(edges)
+        edge_density = np.count_nonzero(edges) / edges.size
+
+        # Create visualization
+        viz_path = os.path.join(
+            os.path.dirname(image_path),
+            f"sharpness_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+        )
+
+        create_sharpness_visualization(img, edges, mtf_values, viz_path)
+
+        # Calculate overall sharpness score (0-100)
+        # Weight different factors
+        edge_score = min(100, edge_intensity * 0.5)
+        detail_score = min(100, local_var / 50)
+        mtf_score = calculate_mtf_score(mtf_values)
+
+        overall_score = (edge_score * 0.4 + detail_score * 0.3 + mtf_score * 0.3)
+
+        results = {
+            'sharpness_score': float(overall_score),
+            'edge_intensity': float(edge_intensity),
+            'edge_density': float(edge_density),
+            'local_variance': float(local_var),
+            'mtf_values': mtf_values.tolist(),
+            'visualization_path': viz_path,
+            'analysis_time': datetime.now().strftime("%Y%m%d_%H%M%S")
+        }
+
+        return results
+
+    except Exception as e:
+        logging.error(f"Sharpness analysis failed: {str(e)}")
+        raise
+
+def calculate_mtf(gray_image):
+    """Calculate MTF (Modulation Transfer Function) values"""
+    # Calculate frequency response using FFT
+    f_transform = np.fft.fft2(gray_image)
+    f_shift = np.fft.fftshift(f_transform)
+    magnitude = np.abs(f_shift)
+
+    # Calculate radial average
+    center = (magnitude.shape[0] // 2, magnitude.shape[1] // 2)
+    y, x = np.indices(magnitude.shape)
+    r = np.sqrt((x - center[1]) ** 2 + (y - center[0]) ** 2)
+    r = r.astype(int)
+
+    # Calculate the mean for each radius
+    mtf = np.zeros(min(center))
+    for i in range(len(mtf)):
+        mask = r == i
+        if mask.any():
+            mtf[i] = magnitude[mask].mean()
+
+    # Normalize
+    mtf = mtf / mtf[0] if mtf[0] != 0 else mtf
+
+    return mtf
+
+def calculate_mtf_score(mtf_values):
+    """Convert MTF values to a 0-100 score"""
+    # Calculate area under MTF curve
+    area = np.trapz(mtf_values)
+    # Normalize to 0-100 range
+    score = min(100, area * 100 / len(mtf_values))
+    return score
+
+def create_sharpness_visualization(original, edges, mtf_values, output_path):
+    """Create visualization of sharpness analysis"""
+    # Create figure with subplots
+    plt.figure(figsize=(15, 5))
+
+    # Original image
+    plt.subplot(131)
+    plt.imshow(cv2.cvtColor(original, cv2.COLOR_BGR2RGB))
+    plt.title('Original Image')
+    plt.axis('off')
+
+    # Edge detection
+    plt.subplot(132)
+    plt.imshow(edges, cmap='gray')
+    plt.title('Edge Detection')
+    plt.axis('off')
+
+    # MTF plot
+    plt.subplot(133)
+    plt.plot(mtf_values)
+    plt.title('MTF Curve')
+    plt.xlabel('Spatial Frequency')
+    plt.ylabel('MTF')
+    plt.grid(True)
+
+    # Save visualization
+    plt.tight_layout()
+    plt.savefig(output_path)
+    plt.close()
 
 def calculate_line_deviations(lines):
     """Calculate how much lines deviate from being straight"""
@@ -22,7 +157,6 @@ def calculate_line_deviations(lines):
         deviations.append(deviation)
 
     return np.array(deviations)
-
 
 def analyze_distortion(image_path):
     """Analyze lens distortion using a grid chart image"""
@@ -222,7 +356,6 @@ def analyze_vignetting(image_path):
         logging.error(f"Analysis failed: {str(e)}")
         raise
 
-
 def create_vignetting_visualization(image_path, output_path):
     """Create a visualization of the vignetting analysis"""
     try:
@@ -306,7 +439,6 @@ def convert_raw_to_jpeg(raw_path, jpeg_path):
         logging.error(f"Error converting RAW to JPEG: {e}")
         return False
 
-
 def analyze_scenario_photo(scenario, photo_info):
     """Analyze a single photo from a scenario"""
     if scenario['type'] != 'vignette':
@@ -343,7 +475,6 @@ def analyze_scenario_photo(scenario, photo_info):
     except Exception as e:
         logging.error(f"Error analyzing photo {photo_path}: {e}")
         return False
-
 
 def analyze_bokeh(image_path, click_x, click_y, metadata=None):
     """
@@ -509,7 +640,6 @@ def analyze_bokeh(image_path, click_x, click_y, metadata=None):
         logging.error(f"Bokeh analysis failed: {str(e)}")
         raise
 
-
 def analyze_shape_regularity(contour, radius):
     """Analyze how circular/regular the bokeh shape is"""
     # Calculate circularity
@@ -546,7 +676,6 @@ def analyze_shape_regularity(contour, radius):
     }
 
     return regularity_score, metrics
-
 
 def analyze_color_fringing(roi, center, radius):
     """Analyze color fringing/chromatic aberration in bokeh"""
@@ -590,7 +719,6 @@ def analyze_color_fringing(roi, center, radius):
     }
 
     return fringing_score, metrics
-
 
 def analyze_intensity_distribution(roi, center, radius):
     """Analyze the intensity distribution within bokeh"""
@@ -652,8 +780,6 @@ def analyze_intensity_distribution(roi, center, radius):
 
     return intensity_score, metrics
 
-
-
 def create_bokeh_visualization(roi, center, radius, shape_metrics, color_metrics,
                              intensity_metrics, output_path, metadata=None):
     """Create visualization of bokeh analysis"""
@@ -693,3 +819,79 @@ def create_bokeh_visualization(roi, center, radius, shape_metrics, color_metrics
                 (10, y), font, 0.5, (255, 255, 255), 2)
 
     cv2.imwrite(output_path, viz)
+
+def analyze_chromatic_aberration(image_path):
+    """Analyze chromatic aberration in an image"""
+    logging.info(f"Starting chromatic aberration analysis of image: {image_path}")
+
+    try:
+        # Load and preprocess image
+        if image_path.lower().endswith(('.cr2', '.nef', '.arw')):
+            with rawpy.imread(image_path) as raw:
+                img = raw.postprocess(
+                    use_camera_wb=True,
+                    half_size=True,
+                    no_auto_bright=True,
+                    output_bps=8
+                )
+                img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        else:
+            img = cv2.imread(image_path)
+
+        if img is None:
+            raise ValueError("Failed to load image")
+
+        # Split into color channels
+        b, g, r = cv2.split(img)
+
+        # Calculate color differences between channels
+        rg_diff = cv2.absdiff(r, g)
+        rb_diff = cv2.absdiff(r, b)
+        gb_diff = cv2.absdiff(g, b)
+
+        # Calculate average color differences in high contrast areas
+        edges = cv2.Canny(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), 100, 200)
+        kernel = np.ones((5, 5), np.uint8)
+        edge_region = cv2.dilate(edges, kernel, iterations=1)
+
+        # Measure color differences along edges
+        rg_ca = cv2.mean(rg_diff, mask=edge_region)[0]
+        rb_ca = cv2.mean(rb_diff, mask=edge_region)[0]
+        gb_ca = cv2.mean(gb_diff, mask=edge_region)[0]
+
+        # Create visualization
+        viz_path = os.path.join(
+            os.path.dirname(image_path),
+            f"ca_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+        )
+
+        # Create heatmap visualization
+        ca_map = cv2.addWeighted(rg_diff, 0.33, rb_diff, 0.33, 0)
+        ca_map = cv2.addWeighted(ca_map, 1.0, gb_diff, 0.33, 0)
+        ca_heatmap = cv2.applyColorMap(ca_map, cv2.COLORMAP_JET)
+
+        # Overlay on original image
+        viz = cv2.addWeighted(img, 0.7, ca_heatmap, 0.3, 0)
+        cv2.imwrite(viz_path, viz)
+
+        # Calculate overall CA score (0-100, lower is better)
+        avg_ca = (rg_ca + rb_ca + gb_ca) / 3.0
+        ca_score = 100 * (1 - min(avg_ca / 50, 1.0))
+
+        results = {
+            'chromatic_aberration_score': float(ca_score),
+            'channel_differences': {
+                'red_green': float(rg_ca),
+                'red_blue': float(rb_ca),
+                'green_blue': float(gb_ca)
+            },
+            'visualization_path': viz_path,
+            'analysis_time': datetime.now().strftime("%Y%m%d_%H%M%S")
+        }
+
+        logging.info(f"Analysis complete. Score: {ca_score:.2f}")
+        return results
+
+    except Exception as e:
+        logging.error(f"Chromatic aberration analysis failed: {str(e)}")
+        raise
