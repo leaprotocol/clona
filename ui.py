@@ -1,4 +1,6 @@
 import os
+from threading import Thread
+
 from nicegui import ui
 import logging
 import time
@@ -62,7 +64,7 @@ class LensAnalysisUI:
             return
 
         # Check if camera is ready
-        is_ready = self.camera_manager.wait_for_camera_ready(timeout=1)  # Short timeout for UI
+        is_ready = self.camera_manager.wait_for_camera_ready(timeout=2)
 
         if is_ready:
             self.status_label.text = '● Camera Ready'
@@ -79,8 +81,14 @@ class LensAnalysisUI:
     def handle_connect_camera(self):
         """Handle camera connection"""
         success = self.camera_manager.initialize_camera()
-        ui.notify('Camera connected successfully' if success else 'Failed to connect camera',
-                  type='positive' if success else 'negative')
+        if success:
+            logging.info("Waiting for camera to be ready...")
+            if self.camera_manager.wait_for_camera_ready(timeout=2):
+                ui.notify('Camera connected and ready', type='positive')
+            else:
+                ui.notify('Camera connected but not ready yet', type='warning')
+        else:
+            ui.notify('Failed to connect camera', type='negative')
         self.update_camera_status()
 
     def handle_disconnect_camera(self):
@@ -157,13 +165,13 @@ class LensAnalysisUI:
 
         dialog.open()
 
+
     def do_capture(self):
         """Regular capture with full metadata"""
         try:
             dataset_path = os.path.join("datasets", self.current_dataset['id'], "photos")
             os.makedirs(dataset_path, exist_ok=True)
 
-            # Capture now returns both path and metadata
             capture_result = self.camera_manager.capture_image("captures")
             if capture_result:
                 temp_path = capture_result['path']
@@ -173,6 +181,9 @@ class LensAnalysisUI:
 
                 shutil.move(temp_path, final_path)
 
+                # Get all camera settings from the capture result
+                camera_settings = capture_result['metadata']['camera_settings']
+
                 # Create photo info with all metadata
                 photo_info = {
                     'filename': final_filename,
@@ -181,7 +192,14 @@ class LensAnalysisUI:
                     'metadata': {
                         'scenario_type': self.current_scenario['type'],
                         'scenario_id': self.current_scenario['id'],
-                        'camera_settings': capture_result['metadata']['camera_settings']
+                        'camera_settings': camera_settings,
+                        # Also store at top level for easier access
+                        'aperture': camera_settings.get('aperture'),
+                        'shutter_speed': camera_settings.get('shutter_speed'),
+                        'iso': camera_settings.get('iso'),
+                        'lens_name': camera_settings.get('lens_name'),
+                        'camera_model': camera_settings.get('camera_model'),
+                        'focal_length': camera_settings.get('focal_length')
                     }
                 }
 
@@ -203,6 +221,7 @@ class LensAnalysisUI:
         except Exception as e:
             ui.notify(f'Error capturing photo: {str(e)}', type='negative')
             logging.error(f"Error capturing photo: {e}")
+    # ui.py - modify the create_camera_controls method
 
     def create_camera_controls(self):
         """Create camera control section"""
@@ -235,6 +254,279 @@ class LensAnalysisUI:
                     on_click=self.show_camera_settings
                 ).classes('bg-purple-500 text-white')
                 self.settings_button.disable()
+
+                ui.button(
+                    'List All Properties',
+                    on_click=self.show_properties_dialog
+                ).classes('bg-gray-500 text-white')
+
+            # Add focus control section
+            with ui.card().classes('w-full mt-2 p-2 bg-gray-50'):
+                ui.label('Focus Controls').classes('font-bold mb-2')
+
+                # Auto Focus controls
+                with ui.row().classes('gap-2 mt-2'):
+                    ui.button(
+                        'Enable Auto Focus Cancel',
+                        on_click=lambda: self.handle_autofocus(True)
+                    ).classes('bg-blue-400 text-white')
+
+                    ui.button(
+                        'Disable Auto Focus Cancel',
+                        on_click=lambda: self.handle_autofocus(False)
+                    ).classes('bg-blue-400 text-white')
+
+                # Auto Focus Drive controls
+                with ui.row().classes('gap-2 mt-2'):
+                    ui.button(
+                        'Enable AF Drive',
+                        on_click=lambda: self.handle_autofocus_drive(True)
+                    ).classes('bg-teal-400 text-white')
+
+                    ui.button(
+                        'Disable AF Drive',
+                        on_click=lambda: self.handle_autofocus_drive(False)
+                    ).classes('bg-teal-400 text-white')
+
+                # Viewfinder controls
+                with ui.row().classes('gap-2 mt-2'):
+                    ui.button(
+                        'Enable Viewfinder',
+                        on_click=lambda: self.handle_viewfinder(True)
+                    ).classes('bg-indigo-400 text-white')
+
+                    ui.button(
+                        'Disable Viewfinder',
+                        on_click=lambda: self.handle_viewfinder(False)
+                    ).classes('bg-indigo-400 text-white')
+
+                # Focus controls
+                with ui.row().classes('gap-2 mt-2'):
+                    ui.label('Focus Control:').classes('font-bold self-center')
+
+                    # Far focus controls
+                    ui.button(
+                        'Far 3',
+                        on_click=lambda: self.handle_focus('Far 3')
+                    ).classes('bg-emerald-400 text-white')
+
+                    ui.button(
+                        'Far 2',
+                        on_click=lambda: self.handle_focus('Far 2')
+                    ).classes('bg-emerald-400 text-white')
+
+                    ui.button(
+                        'Far 1',
+                        on_click=lambda: self.handle_focus('Far 1')
+                    ).classes('bg-emerald-400 text-white')
+
+                    # Near focus controls
+                    ui.button(
+                        'Near 1',
+                        on_click=lambda: self.handle_focus('Near 1')
+                    ).classes('bg-emerald-400 text-white')
+
+                    ui.button(
+                        'Near 2',
+                        on_click=lambda: self.handle_focus('Near 2')
+                    ).classes('bg-emerald-400 text-white')
+
+                    ui.button(
+                        'Near 3',
+                        on_click=lambda: self.handle_focus('Near 3')
+                    ).classes('bg-emerald-400 text-white')
+
+    def show_properties_dialog(self):
+        """Show dialog with all camera properties"""
+        if not self.camera_manager.connected:
+            ui.notify('Camera not connected', type='warning')
+            return
+
+        try:
+            properties = self.camera_manager.list_all_properties()
+            if not properties:
+                ui.notify('No camera properties found. Check logs for details.', type='negative')
+                return
+
+            dialog = ui.dialog()
+            with dialog, ui.card().classes('p-4 max-w-[800px] max-h-[600px] overflow-auto'):
+                ui.label('Camera Properties').classes('text-xl mb-4')
+
+                # Properties container
+                props_container = ui.column().classes('w-full gap-2')
+
+                # Search input with proper event binding
+                def on_search(e):
+                    search_text = e.value.lower()
+                    props_container.clear()
+
+                    for name, details in sorted(properties.items()):
+                        if search_text and search_text not in name.lower() and search_text not in str(
+                                details['value']).lower():
+                            continue
+
+                        with props_container:
+                            with ui.card().classes('w-full p-2'):
+                                ui.label(f"Name: {name}").classes('font-bold')
+                                ui.label(f"Label: {details['label']}")
+                                ui.label(f"Value: {details['value']}")
+                                if details.get('choices'):
+                                    ui.label(f"Available choices: {', '.join(str(c) for c in details['choices'])}")
+                                ui.label(f"Read-only: {'Yes' if details.get('readonly') else 'No'}")
+
+                search = ui.input('Search properties', on_change=on_search).classes('w-full mb-4')
+
+                # Initial population
+                on_search(type('Event', (), {'value': ''})())  # Create dummy event with empty search
+
+                with ui.row().classes('w-full justify-end mt-4'):
+                    ui.button('Close', on_click=dialog.close).classes('bg-blue-500 text-white')
+
+            dialog.open()
+
+        except Exception as e:
+            ui.notify(f'Error showing properties: {str(e)}', type='negative')
+            logging.error(f"Error in show_properties_dialog: {e}")
+
+    # ui.py
+
+    def show_metadata_card(self, metadata):
+        """Helper method to show consistent metadata display"""
+        with ui.card().classes('w-full p-4 bg-gray-50 mb-4'):
+            ui.label('Capture Settings').classes('font-bold mb-2')
+            with ui.grid(columns=2).classes('gap-2'):
+                cam_settings = metadata.get('camera_settings', {})
+
+                # Get shutter speed and format it correctly
+                shutter_speed = cam_settings.get('shutterspeed', 'Unknown')
+                if shutter_speed != 'Unknown':
+                    if isinstance(shutter_speed, str) and shutter_speed.startswith('1/'):
+                        shutter_display = shutter_speed  # Already in correct format
+                    else:
+                        shutter_display = f"1/{shutter_speed}"
+                else:
+                    shutter_display = 'Unknown'
+
+                logging.info(cam_settings.get('focal_length', 'Unknown'))
+                pairs = [
+                    ('Camera', cam_settings.get('camera_model', 'Unknown')),
+                    ('Lens', cam_settings.get('lens_name', 'Unknown')),
+                    ('Aperture', f"f/{cam_settings.get('aperture', 'Unknown')}"),
+                    ('Shutter Speed', shutter_display),
+                    ('ISO', cam_settings.get('iso', 'Unknown')),
+                    ('Focal Length', f"{cam_settings.get('focal_length', 'Unknown')} mm")
+
+                ]
+
+                for label, value in pairs:
+                    with ui.row().classes('gap-2'):
+                        ui.label(f"{label}:").classes('font-bold text-sm')
+                        ui.label(str(value)).classes('text-sm')
+
+    def handle_focus(self, direction: str):
+        """Handle focus adjustment"""
+        if not self.camera_manager.connected:
+            ui.notify('Camera not connected', type='warning')
+            return
+
+        try:
+            config = self.camera_manager.camera.get_config()
+            OK, manualfocusdrive_cfg = gp.gp_widget_get_child_by_name(config, 'manualfocusdrive')
+            if OK >= gp.GP_OK:
+                manualfocusdrive_cfg.set_value(direction)
+                print(direction)
+                self.camera_manager.camera.set_config(config)
+                ui.notify(f'Focus adjusted: {direction}', type='positive')
+            else:
+                ui.notify('Manual focus control not found on camera', type='warning')
+        except Exception as e:
+            ui.notify(f'Error adjusting focus: {str(e)}', type='negative')
+            logging.error(f"Focus control error: {e}")
+
+    def handle_autofocus(self, enable: bool):
+        """Handle enabling/disabling auto focus"""
+        if not self.camera_manager.connected:
+            ui.notify('Camera not connected', type='warning')
+            return
+
+        try:
+            config = self.camera_manager.camera.get_config()
+            OK, autofocus_cfg = gp.gp_widget_get_child_by_name(config, 'cancelautofocus')
+            if OK >= gp.GP_OK:
+                autofocus_cfg.set_value(1 if enable else 0)
+                self.camera_manager.camera.set_config(config)
+                ui.notify(
+                    f'Auto Focus {"enabled" if enable else "disabled"}',
+                    type='positive'
+                )
+            else:
+                ui.notify('Auto Focus control not found on camera', type='warning')
+        except Exception as e:
+            ui.notify(f'Error controlling Auto Focus: {str(e)}', type='negative')
+            logging.error(f"Auto Focus control error: {e}")
+
+    def handle_autofocus_drive(self, enable: bool):
+        """Handle enabling/disabling auto focus drive"""
+        if not self.camera_manager.connected:
+            ui.notify('Camera not connected', type='warning')
+            return
+
+        try:
+            config = self.camera_manager.camera.get_config()
+            OK, autofocus_drive_cfg = gp.gp_widget_get_child_by_name(config, 'autofocusdrive')
+            if OK >= gp.GP_OK:
+                autofocus_drive_cfg.set_value(1 if enable else 0)
+                self.camera_manager.camera.set_config(config)
+                ui.notify(
+                    f'Auto Focus Drive {"enabled" if enable else "disabled"}',
+                    type='positive'
+                )
+            else:
+                ui.notify('Auto Focus Drive control not found on camera', type='warning')
+        except Exception as e:
+            ui.notify(f'Error controlling Auto Focus Drive: {str(e)}', type='negative')
+            logging.error(f"Auto Focus Drive control error: {e}")
+
+
+    def handle_viewfinder(self, enable: bool):
+        """Handle enabling/disabling viewfinder"""
+        if not self.camera_manager.connected:
+            ui.notify('Camera not connected', type='warning')
+            return
+
+        try:
+            # Set lock to prevent other operations during viewfinder changes
+            self.camera_manager.set_camera_connection_lock(True)
+
+            config = self.camera_manager.camera.get_config()
+            OK, viewfinder_cfg = gp.gp_widget_get_child_by_name(config, 'viewfinder')
+            if OK >= gp.GP_OK:
+                if enable:
+                    # First extend mirror with preview
+                    self.camera_manager.camera.capture_preview()
+                    # Then enable viewfinder
+                    viewfinder_cfg.set_value(1)
+                else:
+                    # Disable viewfinder
+                    viewfinder_cfg.set_value(0)
+                    # Re-initiate capture preview to restore camera state
+                    self.camera_manager.camera.capture_preview()
+
+                self.camera_manager.camera.set_config(config)
+
+                ui.notify(
+                    f'Viewfinder {"enabled" if enable else "disabled"}',
+                    type='positive'
+                )
+            else:
+                ui.notify('Viewfinder control not found on camera', type='warning')
+        except Exception as e:
+            ui.notify(f'Error controlling Viewfinder: {str(e)}', type='negative')
+            logging.error(f"Viewfinder control error: {e}")
+        finally:
+            # Always release the lock
+            self.camera_manager.set_camera_connection_lock(False)
+
 
     def create_dataset_dialog(self):
         """Show dialog for creating a new dataset"""
@@ -371,22 +663,18 @@ class LensAnalysisUI:
                 camera_config = self.camera_manager.camera.get_config()
                 settings_to_check = [
                     'aperture', 'iso', 'shutterspeed', 'imageformat', 'capturetarget',
-                    'capturesizeclass', 'capture', 'shootingmode', 'exposurecompensation',
+                    'capturesizeclass', 'capture', 'shooting mode', 'shootingmode', 'exposurecompensation',
                     'flashcompensation', 'datetimeutc', 'datetime',
                     # Focus distance settings
-                    'focusmode', 'focusdistance', 'manualfocusdistance', 'focallength', 'd162',
+                    'focusmode', 'focusdistance', 'focuspoint', 'focus-distance', 'manualfocusdistance', 'focallength', 'd162', 'd127', 'focusinfo',
                     # Exposure mode settings
                     'expprogram', 'exposureprogram', 'autoexposuremode', 'exposuremode',
-                    'capturemode', 'shooting mode', 'shootingmode', 'd054'
+                    'capturemode', 'd054', 'cancelautofocus', 'autofocusdrive','viewfinder'
                 ]
 
                 # Create sections for different types of settings
                 sections = {
-                    'Exposure': ['aperture', 'shutterspeed', 'iso', 'exposurecompensation',
-                                 'expprogram', 'exposuremode', 'autoexposuremode'],
-                    'Focus': ['focusmode', 'focusdistance', 'manualfocusdistance', 'focallength'],
-                    'Capture': ['imageformat', 'capturetarget', 'capturesizeclass', 'capture'],
-                    'Other': []
+                    'Camera': settings_to_check
                 }
 
                 for section_name, setting_keys in sections.items():
@@ -484,6 +772,22 @@ class LensAnalysisUI:
                             with ui.card().classes('p-4'):
                                 ui.label(f"Filename: {photo['filename']}").classes('font-bold')
                                 ui.label(f"Taken: {photo['timestamp']}")
+
+                                # Camera and lens info box
+                                with ui.card().classes('w-full p-2 bg-gray-50 my-2'):
+                                    metadata = photo.get('metadata', {})
+                                    cam_settings = metadata.get('camera_settings', {})
+
+                                    if cam_settings.get('camera_model'):
+                                        ui.label(f"📷 Camera: {cam_settings['camera_model']}").classes('text-sm')
+                                    if cam_settings.get('lens_name'):
+                                        ui.label(f"🔎 Lens: {cam_settings['lens_name']}").classes('text-sm')
+                                    if cam_settings.get('aperture'):
+                                        ui.label(f"Aperture: f/{cam_settings['aperture']}").classes('text-sm')
+                                    if cam_settings.get('shutterspeed'):
+                                        ui.label(f"Shutter time: {cam_settings['shutterspeed']} s").classes('text-sm')
+                                    if cam_settings.get('iso'):
+                                        ui.label(f"ISO: {cam_settings['iso']}").classes('text-sm')
 
                                 # Display photo with click handler for bokeh analysis
                                 if scenario['type'] == 'bokeh':
@@ -683,85 +987,131 @@ class LensAnalysisUI:
 
     # ui.py - fix the do_batch_capture method
 
+    # ui.py
+
+    # ui.py
+
+    # ui.py
+
     def do_batch_capture(self, dialog, apertures):
         """Capture multiple photos with different aperture values"""
         if not self.current_scenario:
             ui.notify('Please select a scenario first', type='warning')
+            dialog.close()
             return
 
         if not apertures:
             ui.notify('Please select at least one aperture value', type='warning')
+            dialog.close()
             return
 
-        logging.info(f"Starting batch capture for apertures: {apertures}")
+        # Close dialog immediately
         dialog.close()
 
-        # Create dataset directory
-        dataset_path = os.path.join("datasets", self.current_dataset['id'], "photos")
-        os.makedirs(dataset_path, exist_ok=True)
+        # Create progress container
+        progress_card = ui.card().classes('w-full p-4 mt-4')
+        with progress_card:
+            ui.label('Batch Capture Progress').classes('text-lg font-bold mb-2')
+            status_label = ui.label('Starting batch capture...').classes('text-blue-500 mb-2')
+            progress = ui.linear_progress(value=0).classes('w-full')
+            aperture_label = ui.label('').classes('text-sm text-gray-600 mt-2')
 
-        # Set exposure mode first, with retry
-        retries = 3
-        while retries > 0:
+        total_apertures = len(apertures)
+        completed = 0
+
+        def update_progress(msg, current_aperture=None):
+            status_label.text = msg
+            if current_aperture:
+                aperture_label.text = f'Current aperture: f/{current_aperture}'
+            nonlocal completed
+            completed += 1
+            progress.value = completed / total_apertures
+
+        def batch_capture_worker():
             try:
-                self.camera_manager.set_exposure_mode('AV')
-                break
+                logging.info(f"Starting batch capture for apertures: {apertures}")
+
+                # Create dataset directory
+                dataset_path = os.path.join("datasets", self.current_dataset['id'], "photos")
+                os.makedirs(dataset_path, exist_ok=True)
+
+                # Set exposure mode
+                retries = 3
+                while retries > 0:
+                    try:
+                        update_progress('Setting exposure mode to Aperture Priority...')
+                        self.camera_manager.set_exposure_mode('AV')
+                        break
+                    except Exception as e:
+                        retries -= 1
+                        logging.warning(f"Failed to set exposure mode, retrying... ({e})")
+                        time.sleep(2)
+
+                for idx, aperture in enumerate(apertures, 1):
+                    try:
+                        update_progress(f'Setting aperture {idx}/{total_apertures}...', aperture)
+
+                        # Set aperture
+                        camera_config = self.camera_manager.camera.get_config()
+                        OK, aperture_widget = gp.gp_widget_get_child_by_name(camera_config, 'aperture')
+                        if OK >= gp.GP_OK:
+                            aperture_widget.set_value(aperture)
+                            self.camera_manager.camera.set_config(camera_config)
+                            time.sleep(1)
+
+                        update_progress(f'Capturing photo {idx}/{total_apertures}...', aperture)
+
+                        # Capture photo
+                        capture_result = self.camera_manager.capture_image("captures")
+                        if capture_result and 'path' in capture_result:
+                            temp_path = capture_result['path']
+
+                            final_filename = f"{self.current_scenario['type']}_f{aperture}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.CR2"
+                            final_path = os.path.join(dataset_path, final_filename)
+                            shutil.move(temp_path, final_path)
+
+                            photo_info = {
+                                'filename': final_filename,
+                                'path': final_path,
+                                'timestamp': datetime.now().strftime("%Y%m%d_%H%M%S"),
+                                'metadata': {
+                                    'aperture': aperture,
+                                    'camera_settings': capture_result.get('metadata', {}).get('camera_settings', {})
+                                }
+                            }
+
+                            if 'photos' not in self.current_scenario:
+                                self.current_scenario['photos'] = []
+                            self.current_scenario['photos'].append(photo_info)
+
+                            self.dataset_manager.update_scenario(
+                                self.current_dataset['id'],
+                                self.current_scenario
+                            )
+
+                            update_progress(f'Successfully captured {idx}/{total_apertures}', aperture)
+
+                    except Exception as e:
+                        logging.error(f"Error during capture at {aperture}: {e}")
+                        update_progress(f'Error during capture {idx}/{total_apertures}: {str(e)}', aperture)
+                        time.sleep(2)
+                        continue
+
+                # Final cleanup
+                update_progress('Batch capture complete!')
+                time.sleep(2)
+                progress_card.delete()
+                self.select_scenario(self.current_scenario)
+
             except Exception as e:
-                retries -= 1
-                logging.warning(f"Failed to set exposure mode, retrying... ({e})")
-                time.sleep(2)  # Wait before retry
+                logging.error(f"Batch capture failed: {e}")
+                update_progress(f'Batch capture failed: {str(e)}')
+                time.sleep(2)
+                progress_card.delete()
 
-        for idx, aperture in enumerate(apertures, 1):
-            try:
-                # Set aperture
-                camera_config = self.camera_manager.camera.get_config()
-                OK, aperture_widget = gp.gp_widget_get_child_by_name(camera_config, 'aperture')
-                if OK >= gp.GP_OK:
-                    aperture_widget.set_value(aperture)
-                    self.camera_manager.camera.set_config(camera_config)
-                    time.sleep(1)  # Wait for setting to take effect
-
-                # Capture photo
-                capture_result = self.camera_manager.capture_image("captures")
-                if capture_result and 'path' in capture_result:  # Check for path in result
-                    temp_path = capture_result['path']  # Get actual path from result
-
-                    # Move to dataset location with scenario type in filename
-                    final_filename = f"{self.current_scenario['type']}_f{aperture}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.CR2"
-                    final_path = os.path.join(dataset_path, final_filename)
-                    shutil.move(temp_path, final_path)
-
-                    # Add to scenario with metadata
-                    photo_info = {
-                        'filename': final_filename,
-                        'path': final_path,
-                        'timestamp': datetime.now().strftime("%Y%m%d_%H%M%S"),
-                        'metadata': {
-                            'aperture': aperture,
-                            'camera_settings': capture_result.get('metadata', {}).get('camera_settings', {})
-                        }
-                    }
-
-                    if 'photos' not in self.current_scenario:
-                        self.current_scenario['photos'] = []
-                    self.current_scenario['photos'].append(photo_info)
-
-                    # Persist changes
-                    self.dataset_manager.update_scenario(
-                        self.current_dataset['id'],
-                        self.current_scenario
-                    )
-
-                    ui.notify(f'Photo captured at f/{aperture}', type='positive')
-
-            except Exception as e:
-                logging.error(f"Error during capture at {aperture}: {e}")
-                ui.notify(f'Error during capture at f/{aperture}: {str(e)}', type='negative')
-                continue
-
-        # Final UI update
-        self.select_scenario(self.current_scenario)
-        ui.notify('Batch capture complete', type='positive')
+        # Start the worker thread
+        capture_thread = Thread(target=batch_capture_worker, daemon=True)
+        capture_thread.start()
 
     def print_available_apertures(self):
         """Print all available camera settings and return aperture settings"""
@@ -872,6 +1222,9 @@ class LensAnalysisUI:
 
     def show_sharpness_results(self, analysis):
         """Display sharpness analysis results"""
+
+        if 'metadata' in analysis:
+            self.show_metadata_card(analysis['metadata'])
         # Show score and timestamp
         with ui.row().classes('w-full justify-between mb-4'):
             ui.label(
@@ -928,6 +1281,8 @@ class LensAnalysisUI:
     def show_bokeh_results(self, analysis):
         """Display bokeh analysis results"""
         logging.info(f"Showing bokeh results with metadata: {analysis.get('metadata', {})}")
+        if 'metadata' in analysis:
+            self.show_metadata_card(analysis['metadata'])
 
         # Show scores and metadata
         with ui.row().classes('w-full justify-between mb-4'):
@@ -1045,7 +1400,14 @@ class LensAnalysisUI:
     def show_vignetting_results(self, analysis):
         """Display vignetting analysis results"""
         results = analysis.get('vignetting_results', {})
-        logging.info(f"Showing vignetting results with preview path: {analysis.get('preview_path')}")
+
+        # Show metadata if available from either source
+        metadata = analysis.get('metadata', {})
+        if not metadata and 'camera_settings' in analysis:
+            metadata = {'camera_settings': analysis['camera_settings']}
+
+        if metadata:
+            self.show_metadata_card(metadata)
 
         # Show score and timestamp
         with ui.row().classes('w-full justify-between mb-4'):
@@ -1116,6 +1478,9 @@ class LensAnalysisUI:
         """Display distortion analysis results"""
         # Add logging
         logging.info(f"Showing distortion results with preview path: {analysis.get('preview_path')}")
+
+        if 'metadata' in analysis:
+            self.show_metadata_card(analysis['metadata'])
 
         # Show score and timestamp
         with ui.row().classes('w-full justify-between mb-4'):
@@ -1188,7 +1553,10 @@ class LensAnalysisUI:
     def run_photo_analysis(self, scenario, photo_info, dialog=None):
         """Run analysis on a photo and save results"""
         try:
-            from analysis import analyze_vignetting, analyze_distortion, analyze_chromatic_aberration  # Added import
+            from analysis import analyze_vignetting, analyze_distortion, analyze_chromatic_aberration
+
+            # Get the metadata from photo_info
+            metadata = photo_info.get('metadata', {})
 
             if scenario['type'] == 'distortion':
                 results = analyze_distortion(photo_info['path'])
@@ -1196,7 +1564,8 @@ class LensAnalysisUI:
                     **results,
                     'preview_path': photo_info['path'],
                     'analyzed_at': datetime.now().strftime("%Y%m%d_%H%M%S"),
-                    'type': 'distortion'
+                    'type': 'distortion',
+                    'metadata': metadata  # Include the metadata
                 }
             elif scenario['type'] == 'vignette':
                 results = analyze_vignetting(photo_info['path'])
@@ -1205,15 +1574,17 @@ class LensAnalysisUI:
                     'visualization_path': results.get('visualization_path'),
                     'preview_path': photo_info['path'],
                     'analyzed_at': datetime.now().strftime("%Y%m%d_%H%M%S"),
-                    'type': 'vignette'
+                    'type': 'vignette',
+                    'metadata': metadata  # Include the metadata
                 }
-            elif scenario['type'] == 'chromatic':  # Add this section
+            elif scenario['type'] == 'chromatic':
                 results = analyze_chromatic_aberration(photo_info['path'])
                 photo_info['analysis'] = {
                     **results,
                     'preview_path': photo_info['path'],
                     'analyzed_at': datetime.now().strftime("%Y%m%d_%H%M%S"),
-                    'type': 'chromatic'
+                    'type': 'chromatic',
+                    'metadata': metadata  # Include the metadata
                 }
 
             # Save updated scenario to dataset

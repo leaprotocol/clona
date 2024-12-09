@@ -20,3 +20,4 @@ platformdirs~=3.1.1
 nicegui~=1.4.3
 matplotlib~=3.5.1
 scikit-learn~=1.4.2
+ExifRead==3.0.0
