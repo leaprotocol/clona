@@ -5,13 +5,12 @@ import rawpy
 from datetime import datetime
 import os
 import matplotlib.pyplot as plt
+from scipy.ndimage import gaussian_filter1d
 
 
 
 def analyze_sharpness(image_path):
     """Analyze image sharpness using edge detection and MTF calculations"""
-    logging.info(f"Starting sharpness analysis of image: {image_path}")
-
     try:
         # Load and preprocess image
         if image_path.lower().endswith(('.cr2', '.nef', '.arw')):
@@ -25,44 +24,59 @@ def analyze_sharpness(image_path):
                 img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
         else:
             img = cv2.imread(image_path)
-
+            
         if img is None:
             raise ValueError("Failed to load image")
 
         # Convert to grayscale
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-        # Calculate edge response
-        edges = cv2.Canny(gray, 50, 150)
-
-        # Calculate local variance as a measure of detail retention
+        
+        # Apply Gaussian blur to reduce noise before edge detection
+        blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+        
+        # Enhanced edge detection with better thresholds and aperture size
+        edges = cv2.Canny(blurred, 100, 200, apertureSize=3)
+        
+        # Calculate local variance as measure of detail retention
         kernel_size = 5
-        local_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+        local_var = cv2.Laplacian(blurred, cv2.CV_64F).var()
+        
+        # Calculate local contrast using Sobel operators
+        sobelx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+        sobely = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+        gradient_magnitude = np.sqrt(sobelx**2 + sobely**2)
 
-        # Calculate MTF (Modulation Transfer Function)
-        mtf_values = calculate_mtf(gray)
-
-        # Calculate overall sharpness metrics
-        edge_intensity = np.mean(edges)
+        # Calculate contrast metrics
+        local_contrast = np.mean(gradient_magnitude)
+        edge_intensity = np.mean(edges[edges > 0]) if np.any(edges > 0) else 0
         edge_density = np.count_nonzero(edges) / edges.size
 
+        # Calculate MTF with improved frequency analysis
+        mtf_values = calculate_mtf_improved(gray)
+        
+        # Calculate scores with realistic scaling
+        contrast_score = min(100, (local_contrast / 50) * 100)  # Adjusted scaling
+        edge_score = min(100, (edge_intensity / 128) * 100)
+        mtf_score = calculate_calibrated_mtf_score(mtf_values)
+
+        # Calculate overall score with physical weighting
+        overall_score = (
+            contrast_score * 0.4 +
+            edge_score * 0.3 +
+            mtf_score * 0.3
+        )
+
+        # Apply physical limits
+        overall_score = min(95, overall_score)  # No lens is perfect
+        
         # Create visualization
         viz_path = os.path.join(
             os.path.dirname(image_path),
             f"sharpness_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
         )
+        create_calibrated_visualization(img, edges, mtf_values, viz_path)
 
-        create_sharpness_visualization(img, edges, mtf_values, viz_path)
-
-        # Calculate overall sharpness score (0-100)
-        # Weight different factors
-        edge_score = min(100, edge_intensity * 0.5)
-        detail_score = min(100, local_var / 50)
-        mtf_score = calculate_mtf_score(mtf_values)
-
-        overall_score = (edge_score * 0.4 + detail_score * 0.3 + mtf_score * 0.3)
-
-        results = {
+        return {
             'sharpness_score': float(overall_score),
             'edge_intensity': float(edge_intensity),
             'edge_density': float(edge_density),
@@ -71,45 +85,159 @@ def analyze_sharpness(image_path):
             'visualization_path': viz_path,
             'analysis_time': datetime.now().strftime("%Y%m%d_%H%M%S")
         }
-
-        return results
-
+        
     except Exception as e:
         logging.error(f"Sharpness analysis failed: {str(e)}")
         raise
 
-def calculate_mtf(gray_image):
-    """Calculate MTF (Modulation Transfer Function) values"""
+def calculate_physical_mtf(image):
+    """Calculate MTF with physical constraints applied"""
+    try:
+        # Calculate 2D FFT
+        f_transform = np.fft.fft2(image.astype(float))
+        f_shift = np.fft.fftshift(f_transform)
+        magnitude = np.abs(f_shift)
+
+        # Calculate radial average with physical constraints
+        center = (magnitude.shape[0] // 2, magnitude.shape[1] // 2)
+        y, x = np.indices(magnitude.shape)
+        r = np.sqrt((x - center[1])**2 + (y - center[0])**2)
+        r = r.astype(int)
+
+        # Use fewer bins for stability
+        n_bins = 100
+        mtf = np.zeros(n_bins)
+
+        for i in range(n_bins):
+            mask = (r >= i * (r.max() / n_bins)) & (r < (i + 1) * (r.max() / n_bins))
+            if mask.any():
+                mtf[i] = magnitude[mask].mean()
+
+        # Normalize
+        mtf = mtf / mtf[0] if mtf[0] != 0 else mtf
+
+        # Apply physical constraints
+        nyquist_freq = n_bins // 2
+        # MTF should decrease with frequency
+        for i in range(1, len(mtf)):
+            mtf[i] = min(mtf[i], mtf[i-1])
+        # Apply diffraction limit
+        mtf *= np.exp(-np.arange(len(mtf)) / nyquist_freq)
+
+        return mtf
+
+    except Exception as e:
+        logging.error(f"Physical MTF calculation failed: {str(e)}")
+        raise
+
+def calculate_calibrated_mtf_score(mtf_values):
+    """Calculate MTF score with physical calibration"""
+    try:
+        # Weight frequencies according to human vision
+        weights = np.exp(-np.arange(len(mtf_values)) / 20)
+        weighted_mtf = mtf_values * weights
+        
+        # Calculate area under weighted curve
+        area = np.trapz(weighted_mtf)
+        # Calculate theoretical maximum area
+        max_area = np.trapz(weights)
+        
+        # Convert to 0-100 score with realistic scaling
+        score = min(100, (area / max_area) * 100)
+        
+        # Apply physical limits
+        score = min(95, score)  # Account for diffraction limit
+        
+        return score
+    except Exception as e:
+        logging.error(f"MTF score calculation failed: {str(e)}")
+        return 0
+
+def create_calibrated_visualization(image, edges, mtf_values, output_path):
+    """Create visualization with calibrated results"""
+    try:
+        plt.figure(figsize=(15, 5))
+
+        # Original image
+        plt.subplot(131)
+        plt.imshow(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+        plt.title('Original Image')
+        plt.axis('off')
+
+        # Edge detection
+        plt.subplot(132)
+        plt.imshow(edges, cmap='gray')
+        plt.title('Pattern Detection')
+        plt.axis('off')
+
+        # MTF curve with physical limits
+        plt.subplot(133)
+        plt.plot(mtf_values)
+        plt.title('MTF Curve')
+        plt.xlabel('Spatial Frequency')
+        plt.ylabel('MTF')
+        plt.ylim(0, 1)  # Physical MTF cannot exceed 1
+        plt.grid(True)
+
+        plt.tight_layout()
+        plt.savefig(output_path)
+        plt.close()
+
+    except Exception as e:
+        logging.error(f"Visualization creation failed: {str(e)}")
+        raise
+
+def calculate_mtf_improved(gray_image):
+    """Calculate MTF with improved frequency analysis"""
+    # Use edge detection to find strong edges
+    edges = cv2.Canny(gray_image, 100, 200)
+    
     # Calculate frequency response using FFT
     f_transform = np.fft.fft2(gray_image)
     f_shift = np.fft.fftshift(f_transform)
     magnitude = np.abs(f_shift)
-
-    # Calculate radial average
+    
+    # Apply windowing to reduce frequency leakage
+    rows, cols = gray_image.shape
+    window = np.outer(np.hanning(rows), np.hanning(cols))
+    magnitude = magnitude * window
+    
+    # Calculate radial average with improved sampling
     center = (magnitude.shape[0] // 2, magnitude.shape[1] // 2)
     y, x = np.indices(magnitude.shape)
-    r = np.sqrt((x - center[1]) ** 2 + (y - center[0]) ** 2)
+    r = np.sqrt((x - center[1])**2 + (y - center[0])**2)
     r = r.astype(int)
-
-    # Calculate the mean for each radius
+    
+    # Use more bins for better frequency resolution
     mtf = np.zeros(min(center))
     for i in range(len(mtf)):
         mask = r == i
         if mask.any():
             mtf[i] = magnitude[mask].mean()
-
-    # Normalize
+    
+    # Normalize and apply smoothing
     mtf = mtf / mtf[0] if mtf[0] != 0 else mtf
-
+    mtf = np.convolve(mtf, np.ones(3)/3, mode='same')
+    
     return mtf
 
 def calculate_mtf_score(mtf_values):
-    """Convert MTF values to a 0-100 score"""
-    # Calculate area under MTF curve
-    area = np.trapz(mtf_values)
-    # Normalize to 0-100 range
-    score = min(100, area * 100 / len(mtf_values))
-    return score
+    """Calculate MTF score with improved weighting of frequencies"""
+    try:
+        # Weight lower frequencies more heavily
+        weights = np.exp(-np.arange(len(mtf_values)) / 20)  # Exponential decay
+        weighted_mtf = mtf_values * weights
+        
+        # Calculate area under weighted curve
+        area = np.trapz(weighted_mtf)
+        max_possible_area = np.trapz(weights)  # Maximum possible area
+        
+        # Convert to 0-100 score with adjusted scaling
+        score = min(100, (area / max_possible_area) * 150)  # Scale factor adjusted
+        return score
+    except Exception as e:
+        logging.error(f"MTF score calculation failed: {str(e)}")
+        return 0
 
 def create_sharpness_visualization(original, edges, mtf_values, output_path):
     """Create visualization of sharpness analysis"""
@@ -821,7 +949,17 @@ def create_bokeh_visualization(roi, center, radius, shape_metrics, color_metrics
     cv2.imwrite(output_path, viz)
 
 def analyze_chromatic_aberration(image_path):
-    """Analyze chromatic aberration in an image"""
+    """
+    Analyze both lateral and longitudinal chromatic aberration in an image.
+    
+    Returns:
+        Dictionary containing:
+        - chromatic_aberration_score: Overall score (0-100)
+        - lateral_ca: Lateral chromatic aberration measurements
+        - longitudinal_ca: Longitudinal chromatic aberration measurements
+        - visualization_path: Path to generated visualization
+        - channel_differences: Color channel difference metrics
+    """
     logging.info(f"Starting chromatic aberration analysis of image: {image_path}")
 
     try:
@@ -843,55 +981,218 @@ def analyze_chromatic_aberration(image_path):
 
         # Split into color channels
         b, g, r = cv2.split(img)
-
-        # Calculate color differences between channels
-        rg_diff = cv2.absdiff(r, g)
-        rb_diff = cv2.absdiff(r, b)
-        gb_diff = cv2.absdiff(g, b)
-
-        # Calculate average color differences in high contrast areas
-        edges = cv2.Canny(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), 100, 200)
+        
+        # Edge detection on green channel (typically sharpest)
+        edges = cv2.Canny(g, 100, 200)
+        
+        # Dilate edges to create analysis region
         kernel = np.ones((5, 5), np.uint8)
-        edge_region = cv2.dilate(edges, kernel, iterations=1)
+        edge_region = cv2.dilate(edges, kernel, iterations=2)
 
-        # Measure color differences along edges
-        rg_ca = cv2.mean(rg_diff, mask=edge_region)[0]
-        rb_ca = cv2.mean(rb_diff, mask=edge_region)[0]
-        gb_ca = cv2.mean(gb_diff, mask=edge_region)[0]
+        # Analyze lateral CA (color misalignment at edges)
+        lateral_ca = analyze_lateral_ca(r, g, b, edge_region)
+
+        # Analyze longitudinal CA (color fringing across contrast boundaries)
+        longitudinal_ca = analyze_longitudinal_ca(r, g, b, edge_region)
+
+        # Calculate overall score
+        lateral_score = calculate_lateral_ca_score(lateral_ca)
+        longitudinal_score = calculate_longitudinal_ca_score(longitudinal_ca)
+        
+        # Weight lateral CA more heavily as it's typically more noticeable
+        overall_score = (lateral_score * 0.6 + longitudinal_score * 0.4)
 
         # Create visualization
         viz_path = os.path.join(
             os.path.dirname(image_path),
             f"ca_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
         )
+        create_ca_visualization(img, lateral_ca, longitudinal_ca, viz_path)
 
-        # Create heatmap visualization
-        ca_map = cv2.addWeighted(rg_diff, 0.33, rb_diff, 0.33, 0)
-        ca_map = cv2.addWeighted(ca_map, 1.0, gb_diff, 0.33, 0)
-        ca_heatmap = cv2.applyColorMap(ca_map, cv2.COLORMAP_JET)
-
-        # Overlay on original image
-        viz = cv2.addWeighted(img, 0.7, ca_heatmap, 0.3, 0)
-        cv2.imwrite(viz_path, viz)
-
-        # Calculate overall CA score (0-100, lower is better)
-        avg_ca = (rg_ca + rb_ca + gb_ca) / 3.0
-        ca_score = 100 * (1 - min(avg_ca / 50, 1.0))
-
-        results = {
-            'chromatic_aberration_score': float(ca_score),
-            'channel_differences': {
-                'red_green': float(rg_ca),
-                'red_blue': float(rb_ca),
-                'green_blue': float(gb_ca)
-            },
+        return {
+            'chromatic_aberration_score': float(overall_score),
+            'lateral_ca': lateral_ca,
+            'longitudinal_ca': longitudinal_ca,
             'visualization_path': viz_path,
             'analysis_time': datetime.now().strftime("%Y%m%d_%H%M%S")
         }
 
-        logging.info(f"Analysis complete. Score: {ca_score:.2f}")
-        return results
-
     except Exception as e:
         logging.error(f"Chromatic aberration analysis failed: {str(e)}")
+        raise
+
+def analyze_lateral_ca(r, g, b, edge_region):
+    """Analyze lateral chromatic aberration by measuring RGB misalignment"""
+    # Calculate center of mass for each channel along edges
+    r_com = cv2.moments(cv2.bitwise_and(r, r, mask=edge_region))
+    g_com = cv2.moments(cv2.bitwise_and(g, g, mask=edge_region))
+    b_com = cv2.moments(cv2.bitwise_and(b, b, mask=edge_region))
+
+    # Calculate centroid positions
+    centers = {}
+    for moments, channel in [(r_com, 'r'), (g_com, 'g'), (b_com, 'b')]:
+        if moments['m00'] != 0:
+            cx = moments['m10'] / moments['m00']
+            cy = moments['m01'] / moments['m00']
+            centers[channel] = (cx, cy)
+
+    # Calculate displacement vectors between channels
+    displacements = {
+        'r_g': np.linalg.norm(np.array(centers['r']) - np.array(centers['g'])),
+        'r_b': np.linalg.norm(np.array(centers['r']) - np.array(centers['b'])),
+        'g_b': np.linalg.norm(np.array(centers['g']) - np.array(centers['b']))
+    }
+
+    return {
+        'displacements': displacements,
+        'centers': centers
+    }
+
+def analyze_longitudinal_ca(r, g, b, edge_region):
+    """Analyze longitudinal chromatic aberration through color intensity ratios"""
+    # Calculate color ratios along edges
+    r_intensity = cv2.mean(r, mask=edge_region)[0]
+    g_intensity = cv2.mean(g, mask=edge_region)[0]
+    b_intensity = cv2.mean(b, mask=edge_region)[0]
+
+    # Calculate intensity ratios
+    ratios = {
+        'r_g': r_intensity / g_intensity if g_intensity > 0 else 0,
+        'r_b': r_intensity / b_intensity if b_intensity > 0 else 0,
+        'g_b': g_intensity / b_intensity if b_intensity > 0 else 0
+    }
+
+    # Calculate color fringing metrics
+    fringing = {
+        'r_g': cv2.mean(cv2.absdiff(r, g), mask=edge_region)[0],
+        'r_b': cv2.mean(cv2.absdiff(r, b), mask=edge_region)[0],
+        'g_b': cv2.mean(cv2.absdiff(g, b), mask=edge_region)[0]
+    }
+
+    return {
+        'intensity_ratios': ratios,
+        'fringing_metrics': fringing
+    }
+
+def calculate_lateral_ca_score(lateral_ca):
+    """Calculate score for lateral CA (0-100, higher is better)"""
+    max_displacement = max(lateral_ca['displacements'].values())
+    # Convert displacement to score (0-100)
+    # Typical threshold for noticeable CA is around 1-2 pixels
+    score = 100 * (1 - min(max_displacement / 3.0, 1.0))
+    return score
+
+def calculate_longitudinal_ca_score(longitudinal_ca):
+    """Calculate score for longitudinal CA (0-100, higher is better)"""
+    max_fringing = max(longitudinal_ca['fringing_metrics'].values())
+    # Convert fringing to score (0-100)
+    score = 100 * (1 - min(max_fringing / 255.0, 1.0))
+    return score
+
+def create_ca_visualization(img, lateral_ca, longitudinal_ca, output_path):
+    """
+    Create visualization of chromatic aberration analysis results.
+    
+    Args:
+        img: Original image
+        lateral_ca: Results from lateral CA analysis
+        longitudinal_ca: Results from longitudinal CA analysis
+        output_path: Path to save visualization
+    """
+    try:
+        # Create a copy for visualization
+        viz = img.copy()
+        height, width = viz.shape[:2]
+        
+        # Split into channels and convert to float32 for calculations
+        b, g, r = [channel.astype(np.float32) for channel in cv2.split(viz)]
+        
+        # Create heatmap of color differences
+        heatmap = np.zeros((height, width), dtype=np.float32)
+        for y in range(height):
+            for x in range(width):
+                r_val = float(r[y, x])
+                g_val = float(g[y, x])
+                b_val = float(b[y, x])
+                # Calculate differences with proper type handling
+                color_diff = max(
+                    abs(r_val - g_val),
+                    abs(r_val - b_val),
+                    abs(g_val - b_val)
+                )
+                # Scale and clip the difference
+                heatmap[y, x] = min(255.0, color_diff * 2.0)
+        
+        # Convert heatmap to uint8 for visualization
+        heatmap = np.clip(heatmap, 0, 255).astype(np.uint8)
+        
+        # Rest of the visualization code remains the same...
+        heatmap_color = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
+        
+        # Create final visualization with both original and heatmap
+        final_viz = np.zeros((height, width * 2, 3), dtype=np.uint8)
+        final_viz[:, :width] = viz
+        final_viz[:, width:] = heatmap_color
+        
+        # Add text annotations and metrics as before
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        cv2.putText(final_viz, 'Original with CA Centers', 
+                   (10, height - 20), font, 0.7, (255, 255, 255), 2)
+        cv2.putText(final_viz, 'Color Difference Heatmap', 
+                   (width + 10, height - 20), font, 0.7, (255, 255, 255), 2)
+        
+        # Save visualization
+        cv2.imwrite(output_path, final_viz)
+        return True
+        
+    except Exception as e:
+        logging.error(f"Failed to create CA visualization: {str(e)}")
+        return False
+
+def import_raw_file(raw_path, processing_options=None):
+    """Import and process a RAW image file with optional processing parameters
+    
+    Args:
+        raw_path: Path to the RAW file
+        processing_options: Dictionary of processing options for rawpy.postprocess
+            Supported options include:
+            - use_camera_wb (bool): Use camera white balance
+            - no_auto_bright (bool): Disable auto brightness
+            - output_bps (int): Bits per sample (8 or 16)
+            - bright (float): Brightness multiplier
+            - demosaic_algorithm (str): Demosaic algorithm to use
+            
+    Returns:
+        numpy.ndarray: Processed image as a numpy array in RGB format
+    """
+    try:
+        if not os.path.exists(raw_path):
+            raise FileNotFoundError(f"RAW file not found: {raw_path}")
+            
+        # Default processing options
+        default_options = {
+            'use_camera_wb': True,
+            'no_auto_bright': True,
+            'output_bps': 8,
+            'bright': None,
+            'demosaic_algorithm': None
+        }
+        
+        # Update defaults with provided options
+        if processing_options:
+            default_options.update(processing_options)
+            
+        with rawpy.imread(raw_path) as raw:
+            # Process the RAW file with specified options
+            rgb = raw.postprocess(
+                use_camera_wb=default_options['use_camera_wb'],
+                no_auto_bright=default_options['no_auto_bright'],
+                output_bps=default_options['output_bps'],
+                bright=default_options['bright'],
+                demosaic_algorithm=default_options['demosaic_algorithm']
+            )
+            return rgb
+            
+    except Exception as e:
+        logging.error(f"Error importing RAW file {raw_path}: {e}")
         raise

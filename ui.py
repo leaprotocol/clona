@@ -10,6 +10,8 @@ import gphoto2 as gp  # Add this import
 import shutil
 import cv2
 from analysis import analyze_bokeh, analyze_sharpness, convert_raw_to_jpeg
+from nicegui.events import UploadEventArguments
+import exifread
 
 class LensAnalysisUI:
     def __init__(self, camera_manager, dataset_manager):
@@ -223,6 +225,107 @@ class LensAnalysisUI:
             logging.error(f"Error capturing photo: {e}")
     # ui.py - modify the create_camera_controls method
 
+    def handle_import_raw(self):
+        """Handle RAW file import"""
+        if not self.current_scenario:
+            ui.notify('Please select a scenario first', type='warning')
+            return
+        
+        def handle_upload(e: UploadEventArguments):
+            try:
+                if not e.name.lower().endswith(('.cr2', '.nef', '.arw')):
+                    ui.notify('Please select a RAW file (.CR2, .NEF, or .ARW)', type='warning')
+                    return
+
+                # Create dataset directory
+                dataset_path = os.path.join("datasets", self.current_dataset['id'], "photos")
+                os.makedirs(dataset_path, exist_ok=True)
+
+                # Import and process the RAW file
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                final_filename = f"{self.current_scenario['type']}_{timestamp}_{e.name}"
+                final_path = os.path.join(dataset_path, final_filename)
+
+                # Save the uploaded file
+                with open(final_path, 'wb') as f:
+                    e.content.seek(0)
+                    shutil.copyfileobj(e.content, f)
+
+                # Generate JPEG preview
+                preview_filename = f"{os.path.splitext(final_filename)[0]}_preview.jpg"
+                preview_path = os.path.join(dataset_path, preview_filename)
+                convert_raw_to_jpeg(final_path, preview_path)
+
+                # Extract EXIF metadata using ExifRead
+                with open(final_path, 'rb') as f:
+                    tags = exifread.process_file(f)
+                    
+                camera_settings = {
+                    'aperture': str(tags.get('EXIF FNumber', '')).split('/')[0] if 'EXIF FNumber' in tags else None,
+                    'shutter_speed': str(tags.get('EXIF ExposureTime', '')),
+                    'iso': str(tags.get('EXIF ISOSpeedRatings', '')),
+                    'lens_name': str(tags.get('EXIF LensModel', '')),
+                    'camera_model': str(tags.get('Image Model', '')),
+                    'focal_length': str(tags.get('EXIF FocalLength', '')).split('/')[0] if 'EXIF FocalLength' in tags else None
+                }
+
+                # Create photo info with metadata
+                photo_info = {
+                    'filename': final_filename,
+                    'path': final_path,
+                    'preview_path': preview_path,
+                    'timestamp': timestamp,
+                    'metadata': {
+                        'scenario_type': self.current_scenario['type'],
+                        'scenario_id': self.current_scenario['id'],
+                        'import_method': 'direct_raw_import',
+                        'camera_settings': camera_settings,
+                        # Also store at top level for easier access
+                        'aperture': camera_settings['aperture'],
+                        'shutter_speed': camera_settings['shutter_speed'],
+                        'iso': camera_settings['iso'],
+                        'lens_name': camera_settings['lens_name'],
+                        'camera_model': camera_settings['camera_model'],
+                        'focal_length': camera_settings['focal_length']
+                    }
+                }
+
+                if 'photos' not in self.current_scenario:
+                    self.current_scenario['photos'] = []
+                self.current_scenario['photos'].append(photo_info)
+
+                if self.dataset_manager.update_scenario(
+                        self.current_dataset['id'],
+                        self.current_scenario
+                ):
+                    ui.notify('RAW file imported successfully', type='positive')
+                    self.select_scenario(self.current_scenario)
+                else:
+                    ui.notify('File imported but failed to update dataset', type='warning')
+
+            except Exception as e:
+                ui.notify(f'Error importing RAW file: {str(e)}', type='negative')
+                logging.error(f"Error importing RAW file: {e}")
+
+        # Create upload dialog
+        dialog = ui.dialog()
+        with dialog, ui.card():
+            ui.label('Import RAW File').classes('text-xl mb-4')
+            
+            ui.upload(
+                label='Choose RAW file',
+                on_upload=handle_upload,
+                max_file_size=100_000_000,  # 100MB max file size
+                on_rejected=lambda e: ui.notify(f'File rejected: {e}', type='error'),
+                multiple=False,
+                auto_upload=True
+            ).props('accept=".cr2,.nef,.arw"').classes('mb-4')
+            
+            with ui.row().classes('gap-2 justify-end'):
+                ui.button('Cancel', on_click=dialog.close).classes('bg-gray-500 text-white')
+
+        dialog.open()
+
     def create_camera_controls(self):
         """Create camera control section"""
         with ui.card().classes('w-full mb-4'):
@@ -248,6 +351,11 @@ class LensAnalysisUI:
                     on_click=self.handle_capture_photo
                 ).classes('bg-green-500 text-white')
                 self.capture_button.disable()
+
+                ui.button(
+                    '📁 Import RAW',
+                    on_click=self.handle_import_raw
+                ).classes('bg-purple-500 text-white')
 
                 self.settings_button = ui.button(
                     '⚙️ Camera Settings',
@@ -745,7 +853,7 @@ class LensAnalysisUI:
 
         self.refresh_dataset_list()
 
-    def select_scenario(self, scenario):
+    async def select_scenario(self, scenario):
         """Select and display a scenario"""
         self.current_scenario = scenario
         self.scenario_details.clear()
@@ -836,6 +944,11 @@ class LensAnalysisUI:
                                     elif scenario['type'] == 'bokeh':
                                         if 'analysis' not in photo:
                                             ui.label('Click image to analyze bokeh').classes('text-sm text-gray-500')
+                                    elif scenario['type'] == 'sharpness':
+                                        ui.button(
+                                            'Analyze Sharpness',
+                                            on_click=lambda p=photo: self.run_photo_analysis(scenario, p)
+                                        ).classes('bg-blue-500 text-white p-2')
 
                                     if 'analysis' in photo:
                                         ui.button(
@@ -876,6 +989,7 @@ class LensAnalysisUI:
             # For debugging - show current scenario state
             logging.debug(f"Current scenario state: {scenario}")
 
+        return True  # Return success
 
     def refresh_dataset_list(self):
         """Refresh the dataset list display"""
@@ -985,14 +1099,6 @@ class LensAnalysisUI:
                 # Start periodic status updates
                 ui.timer(2.0, self.update_camera_status)
 
-    # ui.py - fix the do_batch_capture method
-
-    # ui.py
-
-    # ui.py
-
-    # ui.py
-
     def do_batch_capture(self, dialog, apertures):
         """Capture multiple photos with different aperture values"""
         if not self.current_scenario:
@@ -1039,8 +1145,8 @@ class LensAnalysisUI:
                 retries = 3
                 while retries > 0:
                     try:
-                        update_progress('Setting exposure mode to Aperture Priority...')
-                        self.camera_manager.set_exposure_mode('AV')
+                        update_progress('Setting exposure mode to Manual...')
+                        self.camera_manager.set_exposure_mode('M')
                         break
                     except Exception as e:
                         retries -= 1
@@ -1553,11 +1659,20 @@ class LensAnalysisUI:
     def run_photo_analysis(self, scenario, photo_info, dialog=None):
         """Run analysis on a photo and save results"""
         try:
-            from analysis import analyze_vignetting, analyze_distortion, analyze_chromatic_aberration
+            from analysis import analyze_vignetting, analyze_distortion, analyze_chromatic_aberration, analyze_sharpness
+
+            # Create loading notification
+            loading_notification = ui.notification(
+                'Analyzing image...',
+                type='ongoing',
+                position='center',
+                timeout=None
+            )
 
             # Get the metadata from photo_info
             metadata = photo_info.get('metadata', {})
 
+            # Run appropriate analysis based on scenario type
             if scenario['type'] == 'distortion':
                 results = analyze_distortion(photo_info['path'])
                 photo_info['analysis'] = {
@@ -1565,7 +1680,7 @@ class LensAnalysisUI:
                     'preview_path': photo_info['path'],
                     'analyzed_at': datetime.now().strftime("%Y%m%d_%H%M%S"),
                     'type': 'distortion',
-                    'metadata': metadata  # Include the metadata
+                    'metadata': metadata
                 }
             elif scenario['type'] == 'vignette':
                 results = analyze_vignetting(photo_info['path'])
@@ -1575,7 +1690,7 @@ class LensAnalysisUI:
                     'preview_path': photo_info['path'],
                     'analyzed_at': datetime.now().strftime("%Y%m%d_%H%M%S"),
                     'type': 'vignette',
-                    'metadata': metadata  # Include the metadata
+                    'metadata': metadata
                 }
             elif scenario['type'] == 'chromatic':
                 results = analyze_chromatic_aberration(photo_info['path'])
@@ -1584,7 +1699,16 @@ class LensAnalysisUI:
                     'preview_path': photo_info['path'],
                     'analyzed_at': datetime.now().strftime("%Y%m%d_%H%M%S"),
                     'type': 'chromatic',
-                    'metadata': metadata  # Include the metadata
+                    'metadata': metadata
+                }
+            elif scenario['type'] == 'sharpness':
+                results = analyze_sharpness(photo_info['path'])
+                photo_info['analysis'] = {
+                    **results,
+                    'preview_path': photo_info['path'],
+                    'analyzed_at': datetime.now().strftime("%Y%m%d_%H%M%S"),
+                    'type': 'sharpness',
+                    'metadata': metadata
                 }
 
             # Save updated scenario to dataset
@@ -1592,17 +1716,35 @@ class LensAnalysisUI:
                     self.current_dataset['id'],
                     self.current_scenario
             ):
-                ui.notification('Analysis complete', type='positive', position='bottom')
+                # Close loading notification
+                loading_notification.delete()
+                
+                # Close dialog before showing results
                 if dialog:
                     dialog.close()
-                # Refresh the UI
-                self.select_scenario(scenario)
-                # Show results
-                self.show_photo_analysis(scenario, photo_info)
+                
+                async def update_ui():
+                    try:
+                        # Show results in new dialog without waiting for refresh
+                        self.show_photo_analysis(scenario, photo_info)
+                        # Show success notification
+                        ui.notification('Analysis complete', type='positive', position='bottom')
+                        
+                        # Refresh the scenario view in the background
+                        await self.select_scenario(scenario)
+                    except Exception as e:
+                        logging.error(f"Error in UI update: {e}")
+                        ui.notification('Error updating view', type='negative', position='bottom')
+
+                # Schedule UI update
+                ui.timer(0.1, update_ui, once=True)
             else:
+                loading_notification.delete()
                 ui.notification('Analysis failed to save', type='negative', position='bottom')
 
         except Exception as e:
+            if 'loading_notification' in locals():
+                loading_notification.delete()
             ui.notification(f'Error during analysis: {str(e)}', type='negative', position='bottom')
             logging.error(f"Analysis error: {e}")
             if dialog:
