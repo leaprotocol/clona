@@ -17,7 +17,7 @@ def setup_logging():
         '%(asctime)s [%(levelname)s] %(message)s'
     ))
     logging.getLogger().addHandler(handler)
-    logging.getLogger().setLevel(logging.INFO)
+    logging.getLogger().setLevel(logging.DEBUG)
 
 def main():
     """Main application entry point"""

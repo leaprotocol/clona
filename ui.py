@@ -12,6 +12,8 @@ import cv2
 from analysis import analyze_bokeh, analyze_sharpness, convert_raw_to_jpeg
 from nicegui.events import UploadEventArguments
 import exifread
+import rawpy
+import numpy as np
 
 class LensAnalysisUI:
     def __init__(self, camera_manager, dataset_manager):
@@ -299,7 +301,10 @@ class LensAnalysisUI:
                         self.current_scenario
                 ):
                     ui.notify('RAW file imported successfully', type='positive')
-                    self.select_scenario(self.current_scenario)
+                    # Schedule UI refresh after upload
+                    async def refresh_ui():
+                        await self.select_scenario(self.current_scenario)
+                    ui.timer(0.1, refresh_ui, once=True)
                 else:
                     ui.notify('File imported but failed to update dataset', type='warning')
 
@@ -319,7 +324,7 @@ class LensAnalysisUI:
                 on_rejected=lambda e: ui.notify(f'File rejected: {e}', type='error'),
                 multiple=False,
                 auto_upload=True
-            ).props('accept=".cr2,.nef,.arw"').classes('mb-4')
+            ).props('accept=".cr2,.nef,.arw").classes(\'mb-4\')')
             
             with ui.row().classes('gap-2 justify-end'):
                 ui.button('Cancel', on_click=dialog.close).classes('bg-gray-500 text-white')
@@ -1287,7 +1292,7 @@ class LensAnalysisUI:
         except Exception as e:
             logging.error(f"Error getting camera settings: {e}")
             return None
-    def show_photo_analysis(self, scenario, photo_info):
+    async def show_photo_analysis(self, scenario, photo_info):
         """Show analysis dialog for a photo"""
         dialog = ui.dialog()
         with dialog, ui.card().classes('p-4 min-w-[800px]'):
@@ -1324,7 +1329,7 @@ class LensAnalysisUI:
                 elif scenario['type'] == 'chromatic':
                     self.show_chromatic_results(photo_info['analysis'])
 
-            dialog.open()
+        dialog.open()  # Remove await
 
     def show_sharpness_results(self, analysis):
         """Display sharpness analysis results"""
@@ -1461,22 +1466,90 @@ class LensAnalysisUI:
                     ui.label(f"Score: {analysis.get('intensity_distribution', {}).get('score', 0):.1f}/100")
                     ui.label(f"Uniformity: {intensity_metrics.get('std_intensity', 0):.1f}")
 
-    def handle_bokeh_click(self, event, scenario, photo_info):
+    async def handle_bokeh_click(self, event, scenario, photo_info):
         """Handle click on photo for bokeh analysis"""
         try:
+            import cv2
+            import numpy as np
+            from PIL import Image
+
+            # Get click coordinates and scale them
             click_x = event.args.get("offsetX", 0)
             click_y = event.args.get("offsetY", 0)
+            
+            # Get image dimensions via JavaScript
+            js_code = """
+            async function getDimensions() {
+                const img = document.querySelector('img[src*="bokeh"]');
+                if (img) {
+                    return {
+                        clientWidth: img.clientWidth,
+                        clientHeight: img.clientHeight,
+                        naturalWidth: img.naturalWidth,
+                        naturalHeight: img.naturalHeight
+                    };
+                }
+                return null;
+            }
+            return await getDimensions();
+            """
+            dimensions = await ui.run_javascript(js_code)
+            
+            if not dimensions:
+                raise ValueError("Could not get image dimensions")
+                
+            client_width = dimensions.get("clientWidth")
+            client_height = dimensions.get("clientHeight")
+            natural_width = dimensions.get("naturalWidth")
+            natural_height = dimensions.get("naturalHeight")
 
-            logging.info(f"Processing bokeh click at coordinates: ({click_x}, {click_y})")
-            logging.info(f"Photo info received: {photo_info}")
-            logging.info(f"Photo metadata: {photo_info.get('metadata', {})}")
+            # Scale click coordinates to match original image dimensions
+            scaled_x = int((click_x / client_width) * natural_width)
+            scaled_y = int((click_y / client_height) * natural_height)
 
+            logging.info(f"""
+            Coordinate Scaling:
+            - Display dimensions: {client_width}x{client_height}
+            - Natural dimensions: {natural_width}x{natural_height}
+            - Click coordinates (display): ({click_x}, {click_y})
+            - Scaled coordinates (natural): ({scaled_x}, {scaled_y})
+            """)
+
+            # Create debug visualization before analysis
+            debug_path = os.path.join(
+                os.path.dirname(photo_info['path']),
+                f"click_debug_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+            )
+            
+            try:
+                # Load image and create debug overlay
+                img = cv2.imread(photo_info['path'])
+                if img is not None:
+                    # Draw click point
+                    cv2.circle(img, (scaled_x, scaled_y), 50, (0, 0, 255), 3)
+                    
+                    # Draw ROI boxes for analysis
+                    roi_sizes = [200, 400, 800]  # Multiple ROI sizes for debugging
+                    for roi_size in roi_sizes:
+                        x1 = max(0, scaled_x - roi_size)
+                        y1 = max(0, scaled_y - roi_size)
+                        x2 = min(img.shape[1], scaled_x + roi_size)
+                        y2 = min(img.shape[0], scaled_y + roi_size)
+                        cv2.rectangle(img, (x1, y1), (x2, y2), (255, 0, 0), 2)
+                    
+                    cv2.imwrite(debug_path, img)
+                    logging.info(f"Saved debug visualization to {debug_path}")
+            except Exception as e:
+                logging.error(f"Failed to create debug visualization: {e}")
+
+            # Continue with analysis using scaled coordinates
             ui.notify('Starting bokeh analysis...', type='info')
-
             metadata = photo_info.get('metadata', {})
-            results = analyze_bokeh(photo_info['path'], click_x, click_y, metadata)
-
-            logging.info(f"Analysis results metadata: {results.get('metadata', {})}")
+            results = analyze_bokeh(photo_info['path'], scaled_x, scaled_y, metadata)
+            
+            # Add debug path to results if available
+            if debug_path:
+                results['click_debug_path'] = debug_path
 
             # Store results
             photo_info['analysis'] = {
@@ -1486,22 +1559,21 @@ class LensAnalysisUI:
                 'type': 'bokeh'
             }
 
-            logging.info(f"Final analysis stored: {photo_info['analysis'].get('metadata', {})}")
-
-            # Save updated scenario
-            if self.dataset_manager.update_scenario(
-                    self.current_dataset['id'],
-                    scenario
-            ):
+            # Check if update_scenario is asynchronous
+            update_success = self.dataset_manager.update_scenario(
+                self.current_dataset['id'],
+                scenario
+            )
+            if update_success:  # Remove await if update_scenario is not async
                 ui.notify('Bokeh analysis complete', type='positive')
-                self.select_scenario(scenario)
-                self.show_photo_analysis(scenario, photo_info)
+                await self.select_scenario(scenario)
+                await self.show_photo_analysis(scenario, photo_info)
             else:
                 ui.notify('Failed to save analysis results', type='negative')
 
         except Exception as e:
-            ui.notify(f'Error during bokeh analysis: {str(e)}', type='negative')
-            logging.error(f"Bokeh analysis error: {e}")
+            logging.error(f"Error in bokeh analysis: {str(e)}")
+            ui.notify(f"Analysis failed: {str(e)}", type='negative')
 
     def show_vignetting_results(self, analysis):
         """Display vignetting analysis results"""
@@ -1656,7 +1728,7 @@ class LensAnalysisUI:
                     'mt-2 text-sm text-gray-600')
 
 
-    def run_photo_analysis(self, scenario, photo_info, dialog=None):
+    async def run_photo_analysis(self, scenario, photo_info, dialog=None):
         """Run analysis on a photo and save results"""
         try:
             from analysis import analyze_vignetting, analyze_distortion, analyze_chromatic_aberration, analyze_sharpness
@@ -1690,7 +1762,6 @@ class LensAnalysisUI:
                     'preview_path': photo_info['path'],
                     'analyzed_at': datetime.now().strftime("%Y%m%d_%H%M%S"),
                     'type': 'vignette',
-                    'metadata': metadata
                 }
             elif scenario['type'] == 'chromatic':
                 results = analyze_chromatic_aberration(photo_info['path'])
@@ -1712,7 +1783,7 @@ class LensAnalysisUI:
                 }
 
             # Save updated scenario to dataset
-            if self.dataset_manager.update_scenario(
+            if await self.dataset_manager.update_scenario(
                     self.current_dataset['id'],
                     self.current_scenario
             ):
@@ -1723,32 +1794,19 @@ class LensAnalysisUI:
                 if dialog:
                     dialog.close()
                 
-                async def update_ui():
-                    try:
-                        # Show results in new dialog without waiting for refresh
-                        self.show_photo_analysis(scenario, photo_info)
-                        # Show success notification
-                        ui.notification('Analysis complete', type='positive', position='bottom')
-                        
-                        # Refresh the scenario view in the background
-                        await self.select_scenario(scenario)
-                    except Exception as e:
-                        logging.error(f"Error in UI update: {e}")
-                        ui.notification('Error updating view', type='negative', position='bottom')
-
-                # Schedule UI update
-                ui.timer(0.1, update_ui, once=True)
+                # Show results in new dialog
+                await self.show_photo_analysis(scenario, photo_info)
+                ui.notification('Analysis complete', type='positive', position='bottom')
+                
+                # Refresh the scenario view
+                await self.select_scenario(scenario)
             else:
                 loading_notification.delete()
-                ui.notification('Analysis failed to save', type='negative', position='bottom')
+                ui.notification('Failed to save analysis results', type='negative')
 
         except Exception as e:
-            if 'loading_notification' in locals():
-                loading_notification.delete()
-            ui.notification(f'Error during analysis: {str(e)}', type='negative', position='bottom')
-            logging.error(f"Analysis error: {e}")
-            if dialog:
-                dialog.close()
+            logging.error(f"Error in photo analysis: {str(e)}")
+            ui.notification(f"Analysis failed: {str(e)}", type='negative')
     def show_chromatic_results(self, analysis):
         """Display chromatic aberration analysis results"""
         # Show score and timestamp
@@ -1853,8 +1911,10 @@ class LensAnalysisUI:
                     scenario
             ):
                 ui.notify('Photo deleted successfully', type='positive')
-                # Refresh the scenario view
-                self.select_scenario(scenario)
+                # Force a full UI refresh by re-selecting the scenario
+                async def refresh_ui():
+                    await self.select_scenario(scenario)
+                ui.timer(0.1, refresh_ui, once=True)
             else:
                 ui.notify('Failed to update scenario after delete', type='negative')
 
@@ -1866,3 +1926,28 @@ class LensAnalysisUI:
         """Start the UI"""
         self.create_main_page()
         ui.run()
+
+    def show_click_debug(self, img_path, click_x, click_y):
+        """Debug helper to visualize click location"""
+        try:
+            import cv2
+            import numpy as np
+            
+            # Load image
+            img = cv2.imread(img_path)
+            if img is None:
+                return
+                
+            # Draw click point
+            cv2.circle(img, (int(click_x), int(click_y)), 5, (0, 0, 255), -1)
+            
+            # Save debug image
+            debug_path = os.path.join(
+                os.path.dirname(img_path),
+                f"click_debug_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg")
+            cv2.imwrite(debug_path, img)
+            return debug_path
+            
+        except Exception as e:
+            logging.error(f"Error creating click debug: {e}")
+            return None
