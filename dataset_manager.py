@@ -119,7 +119,7 @@ class DatasetManager:
             logging.error(f"Error importing dataset: {e}")
             return None
 
-    def list_datasets(self) -> List[Dict[str, Any]]:
+    async def list_datasets(self) -> List[Dict[str, Any]]:
         """List all datasets"""
         try:
             datasets = []
@@ -167,38 +167,30 @@ class DatasetManager:
             logging.error(f"Error creating dataset: {e}")
             return None
 
-    def load_dataset(self, dataset_id: str) -> Optional[Dict]:
-        """Load a dataset by ID"""
+    async def load_dataset(self, dataset_id: str) -> Optional[Dict]:
+        """Load dataset by ID"""
         try:
             info_path = os.path.join(self.base_path, dataset_id, "info.json")
             if not os.path.exists(info_path):
-                logging.error(f"Dataset {dataset_id} not found")
+                logging.error(f"Dataset info not found: {info_path}")
                 return None
-
+                
             with open(info_path, 'r') as f:
-                return json.load(f)
+                dataset = json.load(f)
+            return dataset
         except Exception as e:
             logging.error(f"Error loading dataset: {e}")
             return None
 
-    def delete_dataset(self, dataset_id: str) -> bool:
+    async def delete_dataset(self, dataset_id: str) -> bool:
         """Delete a dataset"""
         try:
             dataset_path = os.path.join(self.base_path, dataset_id)
-            if not os.path.exists(dataset_path):
-                logging.error(f"Dataset {dataset_id} not found")
-                return False
-
-            # Delete all files and directories
-            for root, dirs, files in os.walk(dataset_path, topdown=False):
-                for name in files:
-                    os.remove(os.path.join(root, name))
-                for name in dirs:
-                    os.rmdir(os.path.join(root, name))
-            os.rmdir(dataset_path)
-
-            logging.info(f"Deleted dataset: {dataset_id}")
-            return True
+            if os.path.exists(dataset_path):
+                shutil.rmtree(dataset_path)
+                logging.info(f"Deleted dataset: {dataset_id}")
+                return True
+            return False
         except Exception as e:
             logging.error(f"Error deleting dataset: {e}")
             return False
@@ -308,3 +300,35 @@ class DatasetManager:
         except Exception as e:
             logging.error(f"Error updating scenario: {e}")
             return False
+
+    def refresh_dataset_list(self):
+        """Refresh the dataset list display"""
+        self.dataset_list.clear()
+
+        try:
+            datasets = self.dataset_manager.list_datasets()
+            if not datasets:
+                with self.dataset_list:
+                    ui.label('No datasets available').classes('text-gray-500 italic')
+            else:
+                for dataset in datasets:
+                    with self.dataset_list:
+                        with ui.card().classes('w-full p-2'):
+                            with ui.row().classes('justify-between items-center'):
+                                ui.label(dataset['name']).classes(
+                                    'font-bold text-blue-500'
+                                    if dataset == self.current_dataset
+                                    else ''
+                                )
+                                with ui.row().classes('gap-1'):
+                                    ui.button(
+                                        'Select',
+                                        on_click=lambda d=dataset: self.select_dataset(d)
+                                    ).classes('bg-blue-500 text-white p-1 text-sm')
+                                    ui.button(
+                                        'Delete',
+                                        on_click=lambda d=dataset: self.delete_dataset(d)
+                                    ).classes('bg-red-500 text-white p-1 text-sm')
+        except Exception as e:
+            with self.dataset_list:
+                ui.label(f'Error loading datasets: {str(e)}').classes('text-red-500')

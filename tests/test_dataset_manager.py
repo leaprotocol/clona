@@ -27,13 +27,14 @@ def test_create_dataset(dataset_manager):
         info = json.load(f)
         assert info == result
 
-def test_list_datasets(dataset_manager):
+@pytest.mark.asyncio
+async def test_list_datasets(dataset_manager):
     """Test listing datasets"""
     # Create some test datasets
     dataset1 = dataset_manager.create_dataset("Dataset 1")
     dataset2 = dataset_manager.create_dataset("Dataset 2")
     
-    datasets = dataset_manager.list_datasets()
+    datasets = await dataset_manager.list_datasets()
     
     assert len(datasets) == 2
     assert any(d["id"] == dataset1["id"] for d in datasets)

@@ -7,6 +7,7 @@ import time
 import exifread
 import io
 import os
+import asyncio
 
 
 
@@ -304,38 +305,41 @@ class CameraManager:
         self.autofocus_enabled = value
         logging.info(f"Autofocus enabled: {value}")
         
-    def capture_image(self, save_path):
-        """Modified capture_image method to respect new settings"""
+    async def capture_image(self, save_path):
+        """Asynchronous capture with proper I/O handling"""
         if not self.connected:
             logging.error("Cannot capture image: Camera not connected")
             return None
-            
+        
         try:
-            with self.camera_lock:
+            async with asyncio.Lock():  # Use asyncio lock instead of threading.Lock
                 if not self.wait_for_camera_ready():
                     return None
-                    
-                # Only modify camera settings if not honoring existing ones
-                if not self.honor_camera_settings:
-                    if self.autofocus_enabled and not self.autofocus_enabled:
-                        self.trigger_autofocus()
-                    
+                
                 # Capture the image
-                file_path = self.do_camera_operation(self.camera.capture, gp.GP_CAPTURE_IMAGE)
-                
-                # Define where to save the image
-                target = os.path.join(save_path, file_path.name)
-                
-                # Get the camera file
-                camera_file = self.do_camera_operation(
-                    self.camera.file_get, file_path.folder, file_path.name, gp.GP_FILE_TYPE_NORMAL
+                file_path = await asyncio.to_thread(
+                    self.do_camera_operation,
+                    self.camera.capture,
+                    gp.GP_CAPTURE_IMAGE
                 )
                 
-                # Save the camera file to the target destination
-                camera_file.save(target)
+                # Define target path
+                target = os.path.join(save_path, file_path.name)
+                os.makedirs(save_path, exist_ok=True)
                 
-                # Fetch and save metadata
-                metadata = self.get_camera_settings()
+                # Get and save the camera file
+                camera_file = await asyncio.to_thread(
+                    self.do_camera_operation,
+                    self.camera.file_get,
+                    file_path.folder,
+                    file_path.name,
+                    gp.GP_FILE_TYPE_NORMAL
+                )
+                
+                await asyncio.to_thread(camera_file.save, target)
+                
+                # Get metadata after successful save
+                metadata = await asyncio.to_thread(self.get_camera_settings)
                 
                 logging.info(f"Image captured and saved to {target}")
                 return {"path": target, "metadata": metadata}
