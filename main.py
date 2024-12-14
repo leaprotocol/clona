@@ -1,37 +1,33 @@
 import logging
+from ui import LensAnalysisUI
 from camera_manager import CameraManager
 from dataset_manager import DatasetManager
-from ui import LensAnalysisUI
-
-
-def setup_logging():
-    """Set up application logging"""
-    # Remove existing handlers first
-    logger = logging.getLogger()
-    for handler in logger.handlers[:]:
-        logger.removeHandler(handler)
-
-    # Add basic console handler
-    handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter(
-        '%(asctime)s [%(levelname)s] %(message)s'
-    ))
-    logging.getLogger().addHandler(handler)
-    logging.getLogger().setLevel(logging.DEBUG)
 
 def main():
-    """Main application entry point"""
-    # Initialize logging
-    setup_logging()
-    logging.info("Starting Lens Analysis Application")
+    # Configure logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s [%(levelname)s] %(message)s'
+    )
+    
+    logging.debug("Starting Clona Lens Analysis Application")
+    
+    try:
+        # Initialize managers
+        logging.debug("Initializing Camera Manager...")
+        camera_manager = CameraManager()
+        
+        logging.debug("Initializing Dataset Manager...")
+        dataset_manager = DatasetManager()
 
-    # Initialize managers
-    camera_manager = CameraManager()
-    dataset_manager = DatasetManager()
+        # Create and run UI
+        logging.debug("Starting UI...")
+        ui = LensAnalysisUI(camera_manager, dataset_manager)
+        ui.run()
 
-    # Initialize and run UI
-    app_ui = LensAnalysisUI(camera_manager, dataset_manager)
-    app_ui.run()
+    except Exception as e:
+        logging.error(f"Application error: {e}")
+        raise
 
 if __name__ in {"__main__", "__mp_main__"}:
     main()

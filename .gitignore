@@ -109,3 +109,4 @@ calibration_images/
 analysis_results/
 captures/
 datasets/
+testfiles/**

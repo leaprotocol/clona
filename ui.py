@@ -1,24 +1,21 @@
 import os
-from threading import Thread
-
 from nicegui import ui
 import logging
-import time
 from typing import Callable
 from datetime import datetime
 import gphoto2 as gp  # Add this import
 import shutil
-import cv2
 from analysis import analyze_bokeh, analyze_sharpness, convert_raw_to_jpeg
 from nicegui.events import UploadEventArguments
 import exifread
-import rawpy
-import numpy as np
+import asyncio
+import time
 
 class LensAnalysisUI:
     def __init__(self, camera_manager, dataset_manager):
         self.camera_manager = camera_manager
         self.dataset_manager = dataset_manager
+        self.apertures = []  # Initialize apertures as an empty list
         self.current_dataset = None
         self.current_scenario = None
         self.log_display = None
@@ -103,19 +100,26 @@ class LensAnalysisUI:
 
     def handle_capture_photo(self):
         """Handle photo capture"""
-        if not self.camera_manager.connected:
-            ui.notify('Camera not connected', type='negative')
-            return
+        try:
+            if not self.camera_manager.connected :
+                ui.notify('Camera not connected or unavailable', type='negative')
+                return
 
-        if not self.current_scenario:
-            ui.notify('Please select a scenario first', type='warning')
-            return
+            if not self.current_scenario:
+                ui.notify('Please select a scenario first', type='warning')
+                return
 
-        # Include 'distortion' in the list of scenarios that use aperture selection
-        if self.current_scenario['type'] in ['vignette', 'bokeh', 'distortion', 'sharpness', 'chromatic']:
-            self.show_aperture_selection_dialog()
-        else:
-            self.do_capture()
+            if self.current_scenario['type'] in ['vignette', 'bokeh', 'distortion', 'sharpness', 'chromatic']:
+                self.show_aperture_selection_dialog()
+            else:
+                dataset_path = os.path.join("datasets", self.current_dataset['id'], "photos")
+                aperture = self.current_scenario.get('aperture', 'default_aperture')
+                self.do_capture(dataset_path, aperture)
+                
+        except Exception as e:
+            logging.error(f"Error in handle_capture_photo: {e}")
+            self.handle_disconnect_camera()  # Ensure camera is properly disconnected on error
+            ui.notify('Camera error - please reconnect', type='negative')
 
     def show_aperture_selection_dialog(self):
         """Show dialog for selecting multiple apertures for batch capture"""
@@ -144,10 +148,10 @@ class LensAnalysisUI:
                     on_click=force_close_dialog
                 ).classes('text-gray-500')
 
-            aperture_switches = []
+            aperture_checkboxes = []
             for aperture in available_apertures:
-                switch = ui.switch(f'{aperture}')
-                aperture_switches.append((aperture, switch))
+                checkbox = ui.checkbox(f'{aperture}')
+                aperture_checkboxes.append((aperture, checkbox))
 
             with ui.row().classes('gap-2 justify-end mt-4'):
                 ui.button(
@@ -159,9 +163,9 @@ class LensAnalysisUI:
                     'Capture Series',
                     on_click=lambda: self.do_batch_capture(
                         dialog,
-                        [ap for ap, sw in aperture_switches if sw.value]
+                        [ap for ap, cb in aperture_checkboxes if cb.value]
                     )
-                ).classes('bg-green-500 text-white')
+                ).classes('bg-blue-500 text-white')
 
         # Add escape key and outside click handlers with force close
         dialog.on_escape = force_close_dialog
@@ -169,8 +173,7 @@ class LensAnalysisUI:
 
         dialog.open()
 
-
-    def do_capture(self):
+    def do_capture(self, dataset_path, aperture):
         """Regular capture with full metadata"""
         try:
             dataset_path = os.path.join("datasets", self.current_dataset['id'], "photos")
@@ -373,6 +376,35 @@ class LensAnalysisUI:
                     on_click=self.show_properties_dialog
                 ).classes('bg-gray-500 text-white')
 
+            # Camera Settings Controls
+            with ui.card().classes('w-full mt-2 p-2 bg-gray-50'):
+                ui.label('Camera Settings').classes('text-xl mb-4')
+                
+                # Capture Target Setting
+                with ui.row().classes('w-full items-center mb-4'):
+                    ui.label('Storage Location:').classes('mr-4')
+                    capture_target = ui.select(
+                        options=['Memory card', 'Internal RAM'],
+                        value='Memory card',
+                        on_change=lambda e: self.camera_manager.set_config_value('capturetarget', e.value)
+                    ).classes('w-40')
+                
+                # Autofocus Setting
+                with ui.row().classes('w-full items-center mb-4'):
+                    ui.label('Enable Autofocus:').classes('mr-4')
+                    autofocus_switch = ui.switch(
+                        value=False,  # Default to off
+                        on_change=lambda e: self.camera_manager.set_autofocus_enabled(e.value)
+                    )
+                
+                # Honor Camera Settings
+                with ui.row().classes('w-full items-center mb-4'):
+                    ui.label('Honor Camera Settings:').classes('mr-4')
+                    honor_settings_switch = ui.switch(
+                        value=True,  # Default to on
+                        on_change=lambda e: self.camera_manager.set_honor_camera_settings(e.value)
+                    )
+
             # Add focus control section
             with ui.card().classes('w-full mt-2 p-2 bg-gray-50'):
                 ui.label('Focus Controls').classes('font-bold mb-2')
@@ -520,7 +552,6 @@ class LensAnalysisUI:
                 else:
                     shutter_display = 'Unknown'
 
-                logging.info(cam_settings.get('focal_length', 'Unknown'))
                 pairs = [
                     ('Camera', cam_settings.get('camera_model', 'Unknown')),
                     ('Lens', cam_settings.get('lens_name', 'Unknown')),
@@ -528,7 +559,6 @@ class LensAnalysisUI:
                     ('Shutter Speed', shutter_display),
                     ('ISO', cam_settings.get('iso', 'Unknown')),
                     ('Focal Length', f"{cam_settings.get('focal_length', 'Unknown')} mm")
-
                 ]
 
                 for label, value in pairs:
@@ -829,6 +859,7 @@ class LensAnalysisUI:
                 ui.label(f'Error retrieving camera settings: {str(e)}').classes('text-red-500')
 
             dialog.open()
+
     def select_dataset(self, dataset):
         """Select a dataset and show its details"""
         self.current_dataset = dataset
@@ -1104,709 +1135,78 @@ class LensAnalysisUI:
                 # Start periodic status updates
                 ui.timer(2.0, self.update_camera_status)
 
-    def do_batch_capture(self, dialog, apertures):
-        """Capture multiple photos with different aperture values"""
-        if not self.current_scenario:
-            ui.notify('Please select a scenario first', type='warning')
-            dialog.close()
-            return
+    async def do_batch_capture(self, dialog, apertures):
+        """Perform batch capture for selected apertures"""
+        logging.debug(f"Received apertures for batch capture: {apertures}")
 
         if not apertures:
-            ui.notify('Please select at least one aperture value', type='warning')
-            dialog.close()
+            logging.error("No apertures selected for batch capture.")
+            ui.notify("No apertures selected for batch capture.", type='negative')
             return
 
-        # Close dialog immediately
-        dialog.close()
-
-        # Create progress container
-        progress_card = ui.card().classes('w-full p-4 mt-4')
-        with progress_card:
-            ui.label('Batch Capture Progress').classes('text-lg font-bold mb-2')
-            status_label = ui.label('Starting batch capture...').classes('text-blue-500 mb-2')
-            progress = ui.linear_progress(value=0).classes('w-full')
-            aperture_label = ui.label('').classes('text-sm text-gray-600 mt-2')
-
-        total_apertures = len(apertures)
-        completed = 0
-
-        def update_progress(msg, current_aperture=None):
-            status_label.text = msg
-            if current_aperture:
-                aperture_label.text = f'Current aperture: f/{current_aperture}'
-            nonlocal completed
-            completed += 1
-            progress.value = completed / total_apertures
-
-        def batch_capture_worker():
-            try:
-                logging.info(f"Starting batch capture for apertures: {apertures}")
-
-                # Create dataset directory
-                dataset_path = os.path.join("datasets", self.current_dataset['id'], "photos")
-                os.makedirs(dataset_path, exist_ok=True)
-
-                # Set exposure mode
-                retries = 3
-                while retries > 0:
-                    try:
-                        update_progress('Setting exposure mode to Manual...')
-                        self.camera_manager.set_exposure_mode('M')
-                        break
-                    except Exception as e:
-                        retries -= 1
-                        logging.warning(f"Failed to set exposure mode, retrying... ({e})")
-                        time.sleep(2)
-
-                for idx, aperture in enumerate(apertures, 1):
-                    try:
-                        update_progress(f'Setting aperture {idx}/{total_apertures}...', aperture)
-
-                        # Set aperture
-                        camera_config = self.camera_manager.camera.get_config()
-                        OK, aperture_widget = gp.gp_widget_get_child_by_name(camera_config, 'aperture')
-                        if OK >= gp.GP_OK:
-                            aperture_widget.set_value(aperture)
-                            self.camera_manager.camera.set_config(camera_config)
-                            time.sleep(1)
-
-                        update_progress(f'Capturing photo {idx}/{total_apertures}...', aperture)
-
-                        # Capture photo
-                        capture_result = self.camera_manager.capture_image("captures")
-                        if capture_result and 'path' in capture_result:
-                            temp_path = capture_result['path']
-
-                            final_filename = f"{self.current_scenario['type']}_f{aperture}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.CR2"
-                            final_path = os.path.join(dataset_path, final_filename)
-                            shutil.move(temp_path, final_path)
-
-                            photo_info = {
-                                'filename': final_filename,
-                                'path': final_path,
-                                'timestamp': datetime.now().strftime("%Y%m%d_%H%M%S"),
-                                'metadata': {
-                                    'aperture': aperture,
-                                    'camera_settings': capture_result.get('metadata', {}).get('camera_settings', {})
-                                }
-                            }
-
-                            if 'photos' not in self.current_scenario:
-                                self.current_scenario['photos'] = []
-                            self.current_scenario['photos'].append(photo_info)
-
-                            self.dataset_manager.update_scenario(
-                                self.current_dataset['id'],
-                                self.current_scenario
-                            )
-
-                            update_progress(f'Successfully captured {idx}/{total_apertures}', aperture)
-
-                    except Exception as e:
-                        logging.error(f"Error during capture at {aperture}: {e}")
-                        update_progress(f'Error during capture {idx}/{total_apertures}: {str(e)}', aperture)
-                        time.sleep(2)
-                        continue
-
-                # Final cleanup
-                update_progress('Batch capture complete!')
-                time.sleep(2)
-                progress_card.delete()
-                self.select_scenario(self.current_scenario)
-
-            except Exception as e:
-                logging.error(f"Batch capture failed: {e}")
-                update_progress(f'Batch capture failed: {str(e)}')
-                time.sleep(2)
-                progress_card.delete()
-
-        # Start the worker thread
-        capture_thread = Thread(target=batch_capture_worker, daemon=True)
-        capture_thread.start()
-
-    def print_available_apertures(self):
-        """Print all available camera settings and return aperture settings"""
         try:
-            if not self.camera_manager.connected or not self.camera_manager.camera:
-                logging.error("Cannot get settings: Camera not connected")
-                return None
+            # Close the dialog
+            dialog.close()
 
+            # Determine the correct setting name for aperture
             camera_config = self.camera_manager.camera.get_config()
-            settings_to_check = [
-                'aperture', 'iso', 'shutterspeed', 'imageformat', 'capturetarget',
-                'capturesizeclass', 'capture', 'shootingmode', 'exposurecompensation',
-                'flashcompensation', 'datetimeutc', 'datetime',
-                # Focus distance settings - different cameras use different names
-                'focusmode',  # Some cameras
-                'focusdistance',  # Some cameras
-                'manualfocusdistance',  # Some cameras
-                'focallength',  # Some cameras use this for focus distance
-                'd162',  # Some PTP cameras use this for focus distance
-                # Different cameras might use different names for exposure mode
-                'expprogram',  # Some cameras
-                'exposureprogram',  # Some cameras
-                'autoexposuremode',  # Some cameras
-                'exposuremode',  # Some cameras
-                'capturemode',  # Some cameras
-                'shooting mode',  # Some cameras
-                'shootingmode',  # Some cameras
-                'd054'  # Some PTP cameras use this for exposure mode
+            setting_name = None
+            aperture_settings = [
+                'aperture', 'f-number', 'fnumber', 'aperturevalue', 'd002',
+                'capturesettings/f-number', 'capturesettings/aperture'
             ]
+            for name in aperture_settings:
+                OK, widget = gp.gp_widget_get_child_by_name(camera_config, name)
+                if OK >= gp.GP_OK:
+                    setting_name = name
+                    break
 
-            available_settings = {}
-            aperture_choices = None
+            if not setting_name:
+                logging.error("Aperture setting name not found.")
+                ui.notify("Aperture setting name not found.", type='negative')
+                return
 
-            for setting in settings_to_check:
+            # Set dataset path
+            dataset_path = self.current_dataset.get('path', '/default/path')  # Adjust as needed
+
+            # Proceed with batch capture logic
+            total_apertures = len(apertures)
+            for idx, aperture in enumerate(apertures, 1):
                 try:
-                    OK, widget = gp.gp_widget_get_child_by_name(camera_config, setting)
-                    if OK >= gp.GP_OK:
-                        # For settings that have choices
-                        if widget.get_type() in [gp.GP_WIDGET_RADIO, gp.GP_WIDGET_MENU]:
-                            choices = [widget.get_choice(i) for i in range(widget.count_choices())]
-                            current_value = widget.get_value()
-                            available_settings[setting] = {
-                                'choices': choices,
-                                'current': current_value
-                            }
-                            if setting == 'aperture':
-                                aperture_choices = choices
-                        else:
-                            # For other types of settings, just get current value
-                            available_settings[setting] = {
-                                'current': widget.get_value(),
-                                'choices': None
-                            }
+                    self.update_progress(f'Setting aperture {idx}/{total_apertures}...', aperture)
+                    
+                    # Get fresh config for each iteration
+                    camera_config = self.camera_manager.camera.get_config()
+                    OK, current_widget = gp.gp_widget_get_child_by_name(camera_config, setting_name)
+                    
+                    if OK >= gp.GP_OK and self.set_aperture(camera_config, current_widget, aperture):
+                        # Capture photo
+                        self.update_progress(f'Capturing photo {idx}/{total_apertures}...', aperture)
+                        self.do_capture(dataset_path, aperture)
                 except Exception as e:
-                    logging.debug(f"Setting {setting} not available: {e}")
+                    logging.error(f"Error during capture at {aperture}: {e}")
+                    self.update_progress(f'Error during capture {idx}/{total_apertures}: {str(e)}', aperture)
+                    continue
 
-            # Log all available settings
-            logging.info("Available camera settings:")
-            for setting, values in available_settings.items():
-                if values['choices']:
-                    logging.info(f"{setting}: current={values['current']}, available={values['choices']}")
-                else:
-                    logging.info(f"{setting}: current={values['current']}")
-
-            return aperture_choices
+            self.update_progress('Batch capture complete!')
+            await self.select_scenario(self.current_scenario)
 
         except Exception as e:
-            logging.error(f"Error getting camera settings: {e}")
-            return None
-    async def show_photo_analysis(self, scenario, photo_info):
-        """Show analysis dialog for a photo"""
-        dialog = ui.dialog()
-        with dialog, ui.card().classes('p-4 min-w-[800px]'):
-            with ui.row().classes('w-full justify-between items-center'):
-                title = {
-                    'distortion': 'Distortion Analysis Results',
-                    'vignette': 'Vignetting Analysis Results',
-                    'bokeh': 'Bokeh Analysis Results',
-                    'chromatic': 'Chromatic Aberration Analysis Results'
-                }.get(scenario['type'], 'Analysis Results')
-
-                ui.label(title).classes('text-xl')
-                ui.button(text='✕', on_click=dialog.close).classes('text-gray-500')
-
-            if 'analysis' not in photo_info:
-                with ui.column().classes('gap-4 items-center'):
-                    ui.label('No analysis results available').classes('text-gray-500 italic')
-                    if scenario['type'] == 'bokeh':
-                        ui.label('Click on the image to analyze bokeh').classes('text-sm')
-                    else:
-                        ui.button(
-                            'Analyze Now',
-                            on_click=lambda: self.run_photo_analysis(scenario, photo_info, dialog)
-                        ).classes('bg-blue-500 text-white')
-            else:
-                if scenario['type'] == 'distortion':
-                    self.show_distortion_results(photo_info['analysis'])
-                elif scenario['type'] == 'vignette':
-                    self.show_vignetting_results(photo_info['analysis'])
-                elif scenario['type'] == 'bokeh':
-                    self.show_bokeh_results(photo_info['analysis'])
-                elif scenario['type'] == 'sharpness':
-                    self.show_sharpness_results(photo_info['analysis'])
-                elif scenario['type'] == 'chromatic':
-                    self.show_chromatic_results(photo_info['analysis'])
-
-        dialog.open()  # Remove await
-
-    def show_sharpness_results(self, analysis):
-        """Display sharpness analysis results"""
-
-        if 'metadata' in analysis:
-            self.show_metadata_card(analysis['metadata'])
-        # Show score and timestamp
-        with ui.row().classes('w-full justify-between mb-4'):
-            ui.label(
-                f"Sharpness Score: {analysis.get('sharpness_score', 0):.1f}/100"
-            ).classes('text-xl font-bold')
-            ui.label(
-                f"Analyzed: {analysis.get('analysis_time', 'Unknown')}"
-            ).classes('text-gray-500')
-
-        # Show original and analyzed images side by side
-        with ui.row().classes('gap-4'):
-            # Original Image
-            with ui.card().classes('p-2'):
-                ui.label('Original Image').classes('font-bold mb-2')
-                preview_path = analysis.get('preview_path')
-                if preview_path and preview_path.lower().endswith(('.cr2', '.nef', '.arw')):
-                    jpeg_path = preview_path.rsplit('.', 1)[0] + '_preview.jpg'
-                    if not os.path.exists(jpeg_path):
-                        convert_raw_to_jpeg(preview_path, jpeg_path)
-                    preview_path = jpeg_path
-                if preview_path and os.path.exists(preview_path):
-                    ui.image(preview_path).classes('max-w-xs')
-                else:
-                    ui.label('Preview not available').classes('text-red-500 italic')
-
-            # Analysis Visualization
-            with ui.card().classes('p-2'):
-                ui.label('Analysis').classes('font-bold mb-2')
-                if 'visualization_path' in analysis:
-                    ui.image(analysis['visualization_path']).classes('max-w-xs')
-                else:
-                    ui.label('Visualization not available').classes('text-red-500 italic')
-
-        # Detailed metrics
-        with ui.card().classes('p-4 mt-4'):
-            ui.label('Detailed Measurements').classes('font-bold mb-2')
-            with ui.grid(columns=2).classes('gap-4'):
-                ui.label(f"Edge Intensity: {analysis.get('edge_intensity', 0):.2f}")
-                ui.label(f"Edge Density: {analysis.get('edge_density', 0):.2f}")
-                ui.label(f"Local Variance: {analysis.get('local_variance', 0):.2f}")
-
-        # Analysis interpretation
-        with ui.card().classes('p-4 mt-4 bg-gray-50'):
-            ui.label('Analysis Interpretation').classes('font-bold mb-2')
-            score = analysis.get('sharpness_score', 0)
-            if score >= 80:
-                msg = "Excellent - Very high sharpness and detail retention"
-            elif score >= 60:
-                msg = "Good - Acceptable sharpness for most purposes"
-            else:
-                msg = "Below average sharpness - may indicate focus issues or lens limitations"
-            ui.label(msg)
-
-    def show_bokeh_results(self, analysis):
-        """Display bokeh analysis results"""
-        logging.info(f"Showing bokeh results with metadata: {analysis.get('metadata', {})}")
-        if 'metadata' in analysis:
-            self.show_metadata_card(analysis['metadata'])
-
-        # Show scores and metadata
-        with ui.row().classes('w-full justify-between mb-4'):
-            ui.label(
-                f"Overall Score: {analysis.get('overall_score', 0):.1f}/100"
-            ).classes('text-xl font-bold')
-
-        # Show camera settings
-        with ui.card().classes('w-full p-4 mb-4 bg-gray-50'):
-            with ui.row().classes('gap-4 justify-start'):
-                metadata = analysis.get('metadata', {})
-                logging.info(f"Displaying camera settings from metadata: {metadata}")
-
-                if 'aperture' in metadata:
-                    ui.label(f"f/{metadata['aperture']}").classes('font-mono')
-                if 'shutter_speed' in metadata:
-                    ui.label(f"1/{metadata['shutter_speed']}s").classes('font-mono')
-                if 'iso' in metadata:
-                    ui.label(f"ISO {metadata['iso']}").classes('font-mono')
-
-        # Show original and analyzed images side by side
-        with ui.row().classes('gap-4'):
-            # Original Image
-            with ui.card().classes('p-2'):
-                ui.label('Original Image').classes('font-bold mb-2')
-                preview_path = analysis.get('preview_path')
-
-                # Convert RAW to JPEG for display if needed
-                if preview_path and preview_path.lower().endswith(('.cr2', '.nef', '.arw')):
-                    jpeg_path = preview_path.rsplit('.', 1)[0] + '_preview.jpg'
-                    if not os.path.exists(jpeg_path):
-                        from analysis import convert_raw_to_jpeg
-                        convert_raw_to_jpeg(preview_path, jpeg_path)
-                    preview_path = jpeg_path
-
-                if preview_path and os.path.exists(preview_path):
-                    ui.image(preview_path).classes('max-w-xs')
-                else:
-                    ui.label('Preview not available').classes('text-red-500 italic')
-
-            # Analysis Visualization
-            with ui.card().classes('p-2'):
-                ui.label('Analysis').classes('font-bold mb-2')
-                if 'visualization_path' in analysis:
-                    ui.image(analysis['visualization_path']).classes('max-w-xs')
-                else:
-                    ui.label('Visualization not available').classes('text-red-500 italic')
-
-
-            # Show detailed metrics
-            with ui.grid(columns=3).classes('gap-4 mt-4'):
-                # Shape regularity metrics
-                with ui.card().classes('p-4'):
-                    ui.label('Shape Regularity').classes('font-bold mb-2')
-                    shape_metrics = analysis.get('shape_regularity', {}).get('metrics', {})
-                    ui.label(f"Score: {analysis.get('shape_regularity', {}).get('score', 0):.1f}/100")
-                    ui.label(f"Circularity: {shape_metrics.get('circularity', 0):.3f}")
-
-                # Color fringing metrics
-                with ui.card().classes('p-4'):
-                    ui.label('Color Fringing').classes('font-bold mb-2')
-                    color_metrics = analysis.get('color_fringing', {}).get('metrics', {})
-                    ui.label(f"Score: {analysis.get('color_fringing', {}).get('score', 0):.1f}/100")
-                    ui.label(f"Avg Difference: {color_metrics.get('average_color_difference', 0):.1f}")
-
-                # Intensity metrics
-                with ui.card().classes('p-4'):
-                    ui.label('Intensity Distribution').classes('font-bold mb-2')
-                    intensity_metrics = analysis.get('intensity_distribution', {}).get('metrics', {})
-                    ui.label(f"Score: {analysis.get('intensity_distribution', {}).get('score', 0):.1f}/100")
-                    ui.label(f"Uniformity: {intensity_metrics.get('std_intensity', 0):.1f}")
-
-    async def handle_bokeh_click(self, event, scenario, photo_info):
-        """Handle click on photo for bokeh analysis"""
+            logging.error(f"Batch capture failed: {e}")
+    
+    def set_aperture(self,camera_config, widget, aperture_value):
+        """Set the aperture value on the camera."""
         try:
-            import cv2
-            import numpy as np
-            from PIL import Image
-
-            # Get click coordinates and scale them
-            click_x = event.args.get("offsetX", 0)
-            click_y = event.args.get("offsetY", 0)
-            
-            # Get image dimensions via JavaScript
-            js_code = """
-            async function getDimensions() {
-                const img = document.querySelector('img[src*="bokeh"]');
-                if (img) {
-                    return {
-                        clientWidth: img.clientWidth,
-                        clientHeight: img.clientHeight,
-                        naturalWidth: img.naturalWidth,
-                        naturalHeight: img.naturalHeight
-                    };
-                }
-                return null;
-            }
-            return await getDimensions();
-            """
-            dimensions = await ui.run_javascript(js_code)
-            
-            if not dimensions:
-                raise ValueError("Could not get image dimensions")
-                
-            client_width = dimensions.get("clientWidth")
-            client_height = dimensions.get("clientHeight")
-            natural_width = dimensions.get("naturalWidth")
-            natural_height = dimensions.get("naturalHeight")
-
-            # Scale click coordinates to match original image dimensions
-            scaled_x = int((click_x / client_width) * natural_width)
-            scaled_y = int((click_y / client_height) * natural_height)
-
-            logging.info(f"""
-            Coordinate Scaling:
-            - Display dimensions: {client_width}x{client_height}
-            - Natural dimensions: {natural_width}x{natural_height}
-            - Click coordinates (display): ({click_x}, {click_y})
-            - Scaled coordinates (natural): ({scaled_x}, {scaled_y})
-            """)
-
-            # Create debug visualization before analysis
-            debug_path = os.path.join(
-                os.path.dirname(photo_info['path']),
-                f"click_debug_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
-            )
-            
-            try:
-                # Load image and create debug overlay
-                img = cv2.imread(photo_info['path'])
-                if img is not None:
-                    # Draw click point
-                    cv2.circle(img, (scaled_x, scaled_y), 50, (0, 0, 255), 3)
-                    
-                    # Draw ROI boxes for analysis
-                    roi_sizes = [200, 400, 800]  # Multiple ROI sizes for debugging
-                    for roi_size in roi_sizes:
-                        x1 = max(0, scaled_x - roi_size)
-                        y1 = max(0, scaled_y - roi_size)
-                        x2 = min(img.shape[1], scaled_x + roi_size)
-                        y2 = min(img.shape[0], scaled_y + roi_size)
-                        cv2.rectangle(img, (x1, y1), (x2, y2), (255, 0, 0), 2)
-                    
-                    cv2.imwrite(debug_path, img)
-                    logging.info(f"Saved debug visualization to {debug_path}")
-            except Exception as e:
-                logging.error(f"Failed to create debug visualization: {e}")
-
-            # Continue with analysis using scaled coordinates
-            ui.notify('Starting bokeh analysis...', type='info')
-            metadata = photo_info.get('metadata', {})
-            results = analyze_bokeh(photo_info['path'], scaled_x, scaled_y, metadata)
-            
-            # Add debug path to results if available
-            if debug_path:
-                results['click_debug_path'] = debug_path
-
-            # Store results
-            photo_info['analysis'] = {
-                **results,
-                'preview_path': photo_info['path'],
-                'analyzed_at': datetime.now().strftime("%Y%m%d_%H%M%S"),
-                'type': 'bokeh'
-            }
-
-            # Check if update_scenario is asynchronous
-            update_success = self.dataset_manager.update_scenario(
-                self.current_dataset['id'],
-                scenario
-            )
-            if update_success:  # Remove await if update_scenario is not async
-                ui.notify('Bokeh analysis complete', type='positive')
-                await self.select_scenario(scenario)
-                await self.show_photo_analysis(scenario, photo_info)
-            else:
-                ui.notify('Failed to save analysis results', type='negative')
-
+            gp.gp_widget_set_value(widget, aperture_value)
+            self.camera_manager.camera.set_config(camera_config)
+            logging.debug(f"Aperture set to {aperture_value}")
+            return True
         except Exception as e:
-            logging.error(f"Error in bokeh analysis: {str(e)}")
-            ui.notify(f"Analysis failed: {str(e)}", type='negative')
-
-    def show_vignetting_results(self, analysis):
-        """Display vignetting analysis results"""
-        results = analysis.get('vignetting_results', {})
-
-        # Show metadata if available from either source
-        metadata = analysis.get('metadata', {})
-        if not metadata and 'camera_settings' in analysis:
-            metadata = {'camera_settings': analysis['camera_settings']}
-
-        if metadata:
-            self.show_metadata_card(metadata)
-
-        # Show score and timestamp
-        with ui.row().classes('w-full justify-between mb-4'):
-            ui.label(
-                f"Vignetting Score: {results.get('vignetting_score', 0):.1f}/100"
-            ).classes('text-xl font-bold')
-            ui.label(
-                f"Analyzed: {analysis.get('analyzed_at', 'Unknown')}"
-            ).classes('text-gray-500')
-
-        # Show original and analyzed images side by side
-        with ui.row().classes('gap-4'):
-            # Left side - Original Image
-            with ui.card().classes('p-2'):
-                ui.label('Original Image').classes('font-bold mb-2')
-                preview_path = analysis.get('preview_path')
-
-                # Convert RAW to JPEG for display if needed
-                if preview_path and preview_path.lower().endswith(('.cr2', '.nef', '.arw')):
-                    jpeg_path = preview_path.rsplit('.', 1)[0] + '_preview.jpg'
-                    if not os.path.exists(jpeg_path):
-                        from analysis import convert_raw_to_jpeg
-                        convert_raw_to_jpeg(preview_path, jpeg_path)
-                    preview_path = jpeg_path
-
-                if preview_path and os.path.exists(preview_path):
-                    ui.image(preview_path).classes('max-w-xs')
-                else:
-                    ui.label('Preview not available').classes('text-red-500 italic')
-
-            # Right side - Intensity Map
-            with ui.card().classes('p-2'):
-                ui.label('Intensity Map').classes('font-bold mb-2')
-                if 'visualization_path' in analysis:
-                    ui.image(analysis['visualization_path']).classes('max-w-xs')
-                else:
-                    ui.label('Visualization not available').classes('text-red-500 italic')
-
-        # Corner measurements with colored values based on ratio
-        with ui.card().classes('p-4 mt-4'):
-            ui.label('Corner Measurements').classes('font-bold mb-2')
-            with ui.grid(columns=2).classes('gap-4'):
-                for corner, ratio in results.get('corner_ratios', {}).items():
-                    with ui.card().classes('p-2'):
-                        ui.label(corner.replace('_', ' ').title())
-                        ui.label(f"{ratio:.2f}").classes(
-                            'font-bold text-lg ' +
-                            ('text-green-500' if ratio > 0.8 else
-                             'text-yellow-500' if ratio > 0.6 else
-                             'text-red-500')
-                        )
-
-            ui.label(f"Average corner ratio: {results.get('average_corner_ratio', 0):.2f}").classes('mt-4')
-
-        # Analysis interpretation
-        with ui.card().classes('p-4 mt-4 bg-gray-50'):
-            ui.label('Analysis Interpretation').classes('font-bold mb-2')
-            score = results.get('vignetting_score', 0)
-            if score >= 80:
-                msg = "Excellent - Very minimal vignetting detected"
-            elif score >= 60:
-                msg = "Good - Some light falloff but within normal range"
-            else:
-                msg = "Significant vignetting detected"
-            ui.label(msg)
-
-    def show_distortion_results(self, analysis):
-        """Display distortion analysis results"""
-        # Add logging
-        logging.info(f"Showing distortion results with preview path: {analysis.get('preview_path')}")
-
-        if 'metadata' in analysis:
-            self.show_metadata_card(analysis['metadata'])
-
-        # Show score and timestamp
-        with ui.row().classes('w-full justify-between mb-4'):
-            ui.label(
-                f"Distortion Score: {analysis.get('distortion_score', 0):.1f}/100"
-            ).classes('text-xl font-bold')
-            ui.label(
-                f"Analyzed: {analysis.get('analyzed_at', 'Unknown')}"
-            ).classes('text-gray-500')
-
-        # Show original and analyzed images side by side
-        with ui.row().classes('gap-4'):
-            # Left side - Original Image
-            with ui.card().classes('p-2'):
-                ui.label('Original Image').classes('font-bold mb-2')
-                preview_path = analysis.get('preview_path')
-
-                # Convert RAW to JPEG for display if needed
-                if preview_path and preview_path.lower().endswith(('.cr2', '.nef', '.arw')):
-                    jpeg_path = preview_path.rsplit('.', 1)[0] + '_preview.jpg'
-                    if not os.path.exists(jpeg_path):
-                        from analysis import convert_raw_to_jpeg
-                        convert_raw_to_jpeg(preview_path, jpeg_path)
-                    preview_path = jpeg_path
-
-                if preview_path and os.path.exists(preview_path):
-                    ui.image(preview_path).classes('max-w-xs')
-                else:
-                    ui.label('Preview not available').classes('text-red-500 italic')
-
-            # Right side - Detection Visualization
-            with ui.card().classes('p-2'):
-                ui.label('Grid Detection').classes('font-bold mb-2')
-                if 'visualization_path' in analysis and os.path.exists(analysis['visualization_path']):
-                    ui.image(analysis['visualization_path']).classes('max-w-xs')
-                else:
-                    ui.label('Visualization not available').classes('text-red-500 italic')
-
-        # Detailed metrics
-        with ui.card().classes('p-4 mt-4'):
-            ui.label('Detailed Measurements').classes('font-bold mb-2')
-            with ui.grid(columns=2).classes('gap-4'):
-                h_dev = analysis.get('horizontal_deviations', [])
-                v_dev = analysis.get('vertical_deviations', [])
-                ui.label(f"Number of Lines: {len(h_dev) + len(v_dev)}").classes('font-bold')
-                ui.label(f"Average Deviation: {analysis.get('average_deviation', 0):.2f} pixels")
-                ui.label(f"Horizontal Lines: {len(h_dev)}").classes('text-blue-500')
-                ui.label(f"Vertical Lines: {len(v_dev)}").classes('text-blue-500')
-
-        # Analysis interpretation
-        with ui.card().classes('p-4 mt-4 bg-gray-50'):
-            ui.label('Analysis Interpretation').classes('font-bold mb-2')
-            score = analysis.get('distortion_score', 0)
-            distortion_type = analysis.get('type', 'unknown')
-            if score >= 80:
-                msg = "Excellent - Minimal distortion detected"
-            elif score >= 60:
-                msg = f"Good - Some {distortion_type} distortion but within normal range"
-            else:
-                msg = f"Significant {distortion_type} distortion detected"
-            ui.label(msg)
-
-            if distortion_type == 'barrel':
-                ui.label("Barrel distortion: lines curve outward from center").classes('mt-2 text-sm text-gray-600')
-            elif distortion_type == 'pincushion':
-                ui.label("Pincushion distortion: lines curve inward toward center").classes(
-                    'mt-2 text-sm text-gray-600')
+            logging.error(f"Failed to set aperture: {e}")
+            return False
 
 
-    async def run_photo_analysis(self, scenario, photo_info, dialog=None):
-        """Run analysis on a photo and save results"""
-        try:
-            from analysis import analyze_vignetting, analyze_distortion, analyze_chromatic_aberration, analyze_sharpness
 
-            # Create loading notification
-            loading_notification = ui.notification(
-                'Analyzing image...',
-                type='ongoing',
-                position='center',
-                timeout=None
-            )
-
-            # Get the metadata from photo_info
-            metadata = photo_info.get('metadata', {})
-
-            # Run appropriate analysis based on scenario type
-            if scenario['type'] == 'distortion':
-                results = analyze_distortion(photo_info['path'])
-                photo_info['analysis'] = {
-                    **results,
-                    'preview_path': photo_info['path'],
-                    'analyzed_at': datetime.now().strftime("%Y%m%d_%H%M%S"),
-                    'type': 'distortion',
-                    'metadata': metadata
-                }
-            elif scenario['type'] == 'vignette':
-                results = analyze_vignetting(photo_info['path'])
-                photo_info['analysis'] = {
-                    'vignetting_results': results,
-                    'visualization_path': results.get('visualization_path'),
-                    'preview_path': photo_info['path'],
-                    'analyzed_at': datetime.now().strftime("%Y%m%d_%H%M%S"),
-                    'type': 'vignette',
-                }
-            elif scenario['type'] == 'chromatic':
-                results = analyze_chromatic_aberration(photo_info['path'])
-                photo_info['analysis'] = {
-                    **results,
-                    'preview_path': photo_info['path'],
-                    'analyzed_at': datetime.now().strftime("%Y%m%d_%H%M%S"),
-                    'type': 'chromatic',
-                    'metadata': metadata
-                }
-            elif scenario['type'] == 'sharpness':
-                results = analyze_sharpness(photo_info['path'])
-                photo_info['analysis'] = {
-                    **results,
-                    'preview_path': photo_info['path'],
-                    'analyzed_at': datetime.now().strftime("%Y%m%d_%H%M%S"),
-                    'type': 'sharpness',
-                    'metadata': metadata
-                }
-
-            # Save updated scenario to dataset
-            if await self.dataset_manager.update_scenario(
-                    self.current_dataset['id'],
-                    self.current_scenario
-            ):
-                # Close loading notification
-                loading_notification.delete()
-                
-                # Close dialog before showing results
-                if dialog:
-                    dialog.close()
-                
-                # Show results in new dialog
-                await self.show_photo_analysis(scenario, photo_info)
-                ui.notification('Analysis complete', type='positive', position='bottom')
-                
-                # Refresh the scenario view
-                await self.select_scenario(scenario)
-            else:
-                loading_notification.delete()
-                ui.notification('Failed to save analysis results', type='negative')
-
-        except Exception as e:
-            logging.error(f"Error in photo analysis: {str(e)}")
-            ui.notification(f"Analysis failed: {str(e)}", type='negative')
     def show_chromatic_results(self, analysis):
         """Display chromatic aberration analysis results"""
         # Show score and timestamp
@@ -1908,8 +1308,7 @@ class LensAnalysisUI:
             # Update scenario in dataset
             if self.dataset_manager.update_scenario(
                     self.current_dataset['id'],
-                    scenario
-            ):
+                    scenario):
                 ui.notify('Photo deleted successfully', type='positive')
                 # Force a full UI refresh by re-selecting the scenario
                 async def refresh_ui():
@@ -1917,7 +1316,6 @@ class LensAnalysisUI:
                 ui.timer(0.1, refresh_ui, once=True)
             else:
                 ui.notify('Failed to update scenario after delete', type='negative')
-
         except Exception as e:
             ui.notify(f'Error deleting photo: {str(e)}', type='negative')
             logging.error(f"Error in perform_photo_delete: {e}")
@@ -1951,3 +1349,420 @@ class LensAnalysisUI:
         except Exception as e:
             logging.error(f"Error creating click debug: {e}")
             return None
+
+    def print_available_apertures(self):
+        """Print all available camera settings and return aperture settings"""
+        try:
+            if not self.camera_manager.connected or not self.camera_manager.camera:
+                logging.error("Cannot get settings: Camera not connected")
+                return None
+
+            camera_config = self.camera_manager.camera.get_config()
+            
+            # First, try to set camera to Aperture Priority mode
+            OK, expprogram = gp.gp_widget_get_child_by_name(camera_config, 'expprogram')
+            if OK >= gp.GP_OK:
+                current_mode = expprogram.get_value()
+                logging.info(f"Current exposure mode: {current_mode}")
+                
+                # Try setting to Aperture Priority mode
+                try:
+                    expprogram.set_value('A')
+                    self.camera_manager.camera.set_config(camera_config)
+                    logging.info("Set camera to Aperture Priority mode")
+                except Exception as e:
+                    logging.error(f"Failed to set Aperture Priority mode: {e}")
+
+            # Get fresh config after mode change
+            camera_config = self.camera_manager.camera.get_config()
+            
+            # List of possible aperture setting names for Nikon
+            aperture_settings = [
+                'aperture',
+                'f-number',
+                'fnumber',
+                'aperturevalue',
+                'd002',              # Some Nikons use this PTP code
+                'capturesettings/f-number',  # Some cameras nest settings
+                'capturesettings/aperture'
+            ]
+
+            # Try each possible aperture setting name
+            for setting_name in aperture_settings:
+                try:
+                    OK, widget = gp.gp_widget_get_child_by_name(camera_config, setting_name)
+                    if OK >= gp.GP_OK:
+                        logging.info(f"Found aperture setting under name: {setting_name}")
+                        choices = [widget.get_choice(i) for i in range(widget.count_choices())]
+                        current = widget.get_value()
+                        logging.info(f"Current aperture: {current}")
+                        logging.info(f"Available apertures: {choices}")
+                        return choices
+                except Exception as e:
+                    logging.debug(f"Setting {setting_name} not found: {e}")
+
+            # Debug: Print all available settings
+            logging.info("Available camera settings:")
+            for i in range(camera_config.count_children()):
+                child = camera_config.get_child(i)
+                try:
+                    name = child.get_name()
+                    if child.get_type() in [gp.GP_WIDGET_RADIO, gp.GP_WIDGET_MENU]:
+                        choices = [child.get_choice(j) for j in range(child.count_choices())]
+                        current = child.get_value()
+                        logging.info(f"{name}: current={current}, available={choices}")
+                    else:
+                        value = child.get_value()
+                        logging.info(f"{name}: {value}")
+                except Exception as e:
+                    logging.debug(f"Error getting setting {i}: {e}")
+
+            return None
+
+        except Exception as e:
+            logging.error(f"Error getting camera settings: {e}")
+            return None
+
+    async def show_photo_analysis(self, scenario, photo_info):
+        """Show analysis dialog for a photo"""
+        dialog = ui.dialog()
+        with dialog, ui.card().classes('p-4 min-w-[800px]'):
+            with ui.row().classes('w-full justify-between items-center'):
+                title = {
+                    'distortion': 'Distortion Analysis Results',
+                    'vignette': 'Vignetting Analysis Results',
+                    'bokeh': 'Bokeh Analysis Results',
+                    'chromatic': 'Chromatic Aberration Analysis Results',
+                    'sharpness': 'Sharpness Analysis Results'
+                }.get(scenario['type'], 'Analysis Results')
+
+                ui.label(title).classes('text-xl')
+                ui.button(text='✕', on_click=dialog.close).classes('text-gray-500')
+
+            if 'analysis' not in photo_info:
+                with ui.column().classes('gap-4 items-center'):
+                    ui.label('No analysis results available').classes('text-gray-500 italic')
+                    if scenario['type'] == 'bokeh':
+                        ui.label('Click on the image to analyze bokeh').classes('text-sm')
+                    else:
+                        ui.button(
+                            'Analyze Now',
+                            on_click=lambda: self.run_photo_analysis(scenario, photo_info, dialog)
+                        ).classes('bg-blue-500 text-white')
+            else:
+                if scenario['type'] == 'distortion':
+                    self.show_distortion_results(photo_info['analysis'])
+                elif scenario['type'] == 'vignette':
+                    self.show_vignetting_results(photo_info['analysis'])
+                elif scenario['type'] == 'bokeh':
+                    self.show_bokeh_results(photo_info['analysis'])
+                elif scenario['type'] == 'sharpness':
+                    self.show_sharpness_results(photo_info['analysis'])
+                elif scenario['type'] == 'chromatic':
+                    self.show_chromatic_results(photo_info['analysis'])
+
+        dialog.open()
+
+    def show_vignetting_results(self, analysis):
+        """Display vignetting analysis results"""
+        results = analysis.get('vignetting_results', {})
+
+        # Show metadata if available from either source
+        metadata = analysis.get('metadata', {})
+        if not metadata and 'camera_settings' in analysis:
+            metadata = {'camera_settings': analysis['camera_settings']}
+
+        if metadata:
+            self.show_metadata_card(metadata)
+
+        # Show score and timestamp
+        with ui.row().classes('w-full justify-between mb-4'):
+            ui.label(
+                f"Vignetting Score: {results.get('vignetting_score', 0):.1f}/100"
+            ).classes('text-xl font-bold')
+            ui.label(
+                f"Analyzed: {analysis.get('analyzed_at', 'Unknown')}"
+            ).classes('text-gray-500')
+
+        # Show original and analyzed images side by side
+        with ui.row().classes('gap-4'):
+            # Left side - Original Image
+            with ui.card().classes('p-2'):
+                ui.label('Original Image').classes('font-bold mb-2')
+                preview_path = analysis.get('preview_path')
+
+                # Convert RAW to JPEG for display if needed
+                if preview_path and preview_path.lower().endswith(('.cr2', '.nef', '.arw')):
+                    jpeg_path = preview_path.rsplit('.', 1)[0] + '_preview.jpg'
+                    if not os.path.exists(jpeg_path):
+                        from analysis import convert_raw_to_jpeg
+                        convert_raw_to_jpeg(preview_path, jpeg_path)
+                    preview_path = jpeg_path
+
+                if preview_path and os.path.exists(preview_path):
+                    ui.image(preview_path).classes('max-w-xs')
+                else:
+                    ui.label('Preview not available').classes('text-red-500 italic')
+
+            # Right side - Intensity Map
+            with ui.card().classes('p-2'):
+                ui.label('Intensity Map').classes('font-bold mb-2')
+                if 'visualization_path' in analysis:
+                    ui.image(analysis['visualization_path']).classes('max-w-xs')
+                else:
+                    ui.label('Visualization not available').classes('text-red-500 italic')
+
+        # Corner measurements with colored values based on ratio
+        with ui.card().classes('p-4 mt-4'):
+            ui.label('Corner Measurements').classes('font-bold mb-2')
+            with ui.grid(columns=2).classes('gap-4'):
+                for corner, ratio in results.get('corner_ratios', {}).items():
+                    with ui.card().classes('p-2'):
+                        ui.label(corner.replace('_', ' ').title())
+                        ui.label(f"{ratio:.2f}").classes(
+                            'font-bold text-lg ' +
+                            ('text-green-500' if ratio > 0.8 else
+                             'text-yellow-500' if ratio > 0.6 else
+                             'text-red-500')
+                        )
+
+            ui.label(f"Average corner ratio: {results.get('average_corner_ratio', 0):.2f}").classes('mt-4')
+
+        # Analysis interpretation
+        with ui.card().classes('p-4 mt-4 bg-gray-50'):
+            ui.label('Analysis Interpretation').classes('font-bold mb-2')
+            score = results.get('vignetting_score', 0)
+            if score >= 80:
+                msg = "Excellent - Very minimal vignetting detected"
+            elif score >= 60:
+                msg = "Good - Some light falloff but within normal range"
+            else:
+                msg = "Significant vignetting detected"
+            ui.label(msg)
+
+    async def run_photo_analysis(self, scenario, photo_info, dialog=None):
+        """Run analysis on a photo and save results"""
+        try:
+            from analysis import analyze_vignetting, analyze_distortion, analyze_chromatic_aberration, analyze_sharpness
+
+            # Create loading notification
+            loading_notification = ui.notification(
+                'Analyzing image...',
+                type='ongoing',
+                position='center',
+                timeout=None
+            )
+
+            # Get the metadata from photo_info
+            metadata = photo_info.get('metadata', {})
+
+            # Run appropriate analysis based on scenario type
+            if scenario['type'] == 'distortion':
+                results = analyze_distortion(photo_info['path'])
+                photo_info['analysis'] = {
+                    **results,
+                    'preview_path': photo_info['path'],
+                    'analyzed_at': datetime.now().strftime("%Y%m%d_%H%M%S"),
+                    'type': 'distortion',
+                    'metadata': metadata
+                }
+            elif scenario['type'] == 'vignette':
+                results = analyze_vignetting(photo_info['path'])
+                photo_info['analysis'] = {
+                    'vignetting_results': results,
+                    'visualization_path': results.get('visualization_path'),
+                    'preview_path': photo_info['path'],
+                    'analyzed_at': datetime.now().strftime("%Y%m%d_%H%M%S"),
+                    'type': 'vignette',
+                    'metadata': metadata
+                }
+            elif scenario['type'] == 'chromatic':
+                results = analyze_chromatic_aberration(photo_info['path'])
+                photo_info['analysis'] = {
+                    **results,
+                    'preview_path': photo_info['path'],
+                    'analyzed_at': datetime.now().strftime("%Y%m%d_%H%M%S"),
+                    'type': 'chromatic',
+                    'metadata': metadata
+                }
+            elif scenario['type'] == 'sharpness':
+                results = analyze_sharpness(photo_info['path'])
+                photo_info['analysis'] = {
+                    **results,
+                    'preview_path': photo_info['path'],
+                    'analyzed_at': datetime.now().strftime("%Y%m%d_%H%M%S"),
+                    'type': 'sharpness',
+                    'metadata': metadata
+                }
+
+            # Save updated scenario to dataset
+            if self.dataset_manager.update_scenario(
+                    self.current_dataset['id'],
+                    self.current_scenario
+            ):
+                # Close loading notification
+                loading_notification.delete()
+                
+                # Close dialog before showing results
+                if dialog:
+                    dialog.close()
+                
+                # Show results in new dialog
+                await self.show_photo_analysis(scenario, photo_info)
+                ui.notify('Analysis complete', type='positive', position='bottom')
+                
+                # Refresh the scenario view
+                await self.select_scenario(scenario)
+            else:
+                loading_notification.delete()
+                ui.notify('Failed to save analysis results', type='negative')
+
+        except Exception as e:
+            logging.error(f"Error in photo analysis: {str(e)}")
+            ui.notify(f"Analysis failed: {str(e)}", type='negative')
+
+    def show_bokeh_results(self, analysis):
+        """Display bokeh analysis results"""
+        if 'metadata' in analysis:
+            self.show_metadata_card(analysis['metadata'])
+
+        # Show scores and metadata
+        with ui.row().classes('w-full justify-between mb-4'):
+            ui.label(
+                f"Overall Score: {analysis.get('overall_score', 0):.1f}/100"
+            ).classes('text-xl font-bold')
+
+        # Show original and analyzed images side by side
+        with ui.row().classes('gap-4'):
+            # Original Image
+            with ui.card().classes('p-2'):
+                ui.label('Original Image').classes('font-bold mb-2')
+                preview_path = analysis.get('preview_path')
+                if preview_path and os.path.exists(preview_path):
+                    ui.image(preview_path).classes('max-w-xs')
+                else:
+                    ui.label('Preview not available').classes('text-red-500 italic')
+
+            # Analysis Visualization
+            with ui.card().classes('p-2'):
+                ui.label('Analysis').classes('font-bold mb-2')
+                if 'visualization_path' in analysis:
+                    ui.image(analysis['visualization_path']).classes('max-w-xs')
+                else:
+                    ui.label('Visualization not available').classes('text-red-500 italic')
+
+        # Show detailed metrics
+        with ui.grid(columns=3).classes('gap-4 mt-4'):
+            # Shape regularity metrics
+            with ui.card().classes('p-4'):
+                ui.label('Shape Regularity').classes('font-bold mb-2')
+                shape_metrics = analysis.get('shape_regularity', {}).get('metrics', {})
+                ui.label(f"Score: {analysis.get('shape_regularity', {}).get('score', 0):.1f}/100")
+                ui.label(f"Circularity: {shape_metrics.get('circularity', 0):.3f}")
+
+            # Color fringing metrics
+            with ui.card().classes('p-4'):
+                ui.label('Color Fringing').classes('font-bold mb-2')
+                color_metrics = analysis.get('color_fringing', {}).get('metrics', {})
+                ui.label(f"Score: {analysis.get('color_fringing', {}).get('score', 0):.1f}/100")
+                ui.label(f"Avg Difference: {color_metrics.get('average_color_difference', 0):.1f}")
+
+            # Intensity metrics
+            with ui.card().classes('p-4'):
+                ui.label('Intensity Distribution').classes('font-bold mb-2')
+                intensity_metrics = analysis.get('intensity_distribution', {}).get('metrics', {})
+                ui.label(f"Score: {analysis.get('intensity_distribution', {}).get('score', 0):.1f}/100")
+                ui.label(f"Uniformity: {intensity_metrics.get('std_intensity', 0):.1f}")
+
+        # Analysis interpretation
+        with ui.card().classes('p-4 mt-4 bg-gray-50'):
+            ui.label('Analysis Interpretation').classes('font-bold mb-2')
+            score = analysis.get('overall_score', 0)
+            if score >= 80:
+                msg = "Excellent - Very high sharpness and detail retention"
+            elif score >= 60:
+                msg = "Good - Acceptable sharpness for most purposes"
+            else:
+                msg = "Below average sharpness - may indicate focus issues or lens limitations"
+            ui.label(msg)
+
+    def show_sharpness_results(self, analysis):
+        """Display sharpness analysis results"""
+        if 'metadata' in analysis:
+            self.show_metadata_card(analysis['metadata'])
+
+        # Show score and timestamp
+        with ui.row().classes('w-full justify-between mb-4'):
+            ui.label(
+                f"Sharpness Score: {analysis.get('sharpness_score', 0):.1f}/100"
+            ).classes('text-xl font-bold')
+            ui.label(
+                f"Analyzed: {analysis.get('analysis_time', 'Unknown')}"
+            ).classes('text-gray-500')
+
+        # Show original and analyzed images side by side
+        with ui.row().classes('gap-4'):
+            # Original Image
+            with ui.card().classes('p-2'):
+                ui.label('Original Image').classes('font-bold mb-2')
+                preview_path = analysis.get('preview_path')
+                if preview_path and preview_path.lower().endswith(('.cr2', '.nef', '.arw')):
+                    jpeg_path = preview_path.rsplit('.', 1)[0] + '_preview.jpg'
+                    if not os.path.exists(jpeg_path):
+                        convert_raw_to_jpeg(preview_path, jpeg_path)
+                    preview_path = jpeg_path
+                if preview_path and os.path.exists(preview_path):
+                    ui.image(preview_path).classes('max-w-xs')
+                else:
+                    ui.label('Preview not available').classes('text-red-500 italic')
+
+            # Analysis Visualization
+            with ui.card().classes('p-2'):
+                ui.label('Analysis').classes('font-bold mb-2')
+                if 'visualization_path' in analysis:
+                    ui.image(analysis['visualization_path']).classes('max-w-xs')
+                else:
+                    ui.label('Visualization not available').classes('text-red-500 italic')
+
+        # Detailed metrics
+        with ui.card().classes('p-4 mt-4'):
+            ui.label('Detailed Measurements').classes('font-bold mb-2')
+            with ui.grid(columns=2).classes('gap-4'):
+                ui.label(f"Edge Intensity: {analysis.get('edge_intensity', 0):.2f}")
+                ui.label(f"Edge Density: {analysis.get('edge_density', 0):.2f}")
+                ui.label(f"Local Variance: {analysis.get('local_variance', 0):.2f}")
+
+        # Analysis interpretation
+        with ui.card().classes('p-4 mt-4 bg-gray-50'):
+            ui.label('Analysis Interpretation').classes('font-bold mb-2')
+            score = analysis.get('sharpness_score', 0)
+            if score >= 80:
+                msg = "Excellent - Very high sharpness and detail retention"
+            elif score >= 60:
+                msg = "Good - Acceptable sharpness for most purposes"
+            else:
+                msg = "Below average sharpness - may indicate focus issues or lens limitations"
+            ui.label(msg)
+
+    async def refresh_camera_settings(self, dialog):
+        """Refresh camera settings display"""
+        try:
+            dialog.close()
+            await asyncio.sleep(0.5)  # Give time for the dialog to close
+            self.show_camera_settings()
+        except Exception as e:
+            logging.error(f"Error refreshing camera settings: {e}")
+            ui.notify('Failed to refresh camera settings', type='negative')
+
+    def update_progress(self, message, aperture=None):
+        """Update the progress of the batch capture process"""
+        if aperture:
+            logging.info(f"{message} for aperture {aperture}")
+        else:
+            logging.info(message)
+        # Update the UI or log with the progress message
+        if self.log_display:
+            current = self.log_display.value
+            self.log_display.value = current + message + "\n"
+    
+    

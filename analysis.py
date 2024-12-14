@@ -397,73 +397,70 @@ def analyze_vignetting(image_path):
         # Handle RAW files
         if image_path.lower().endswith(('.cr2', '.nef', '.arw')):
             logging.info("Processing RAW file...")
-            try:
-                with rawpy.imread(image_path) as raw:
-                    # Use sRGB color space and default settings
-                    img = raw.postprocess(
-                        use_camera_wb=True,
-                        half_size=True,  # For faster processing
-                        no_auto_bright=True,
-                        output_bps=8
-                    )
-                    # Convert from RGB to BGR for OpenCV
-                    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-                    logging.info(f"RAW processing successful, image shape: {img.shape}")
-            except Exception as e:
-                logging.error(f"RAW processing failed: {str(e)}")
-                raise
+            with rawpy.imread(image_path) as raw:
+                img = raw.postprocess(
+                    use_camera_wb=True,
+                    half_size=True,
+                    no_auto_bright=True,
+                    output_bps=8
+                )
+                img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
         else:
-            logging.info("Processing regular image file...")
             img = cv2.imread(image_path)
-
-        if img is None or img.size == 0:
-            raise ValueError("Failed to load image data")
 
         # Convert to grayscale
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        logging.info(f"Converted to grayscale, shape: {gray.shape}")
-
+        
         # Get image dimensions
         height, width = gray.shape
+        
+        # Define regions
+        center_size = min(width, height) // 3
+        center_x = width // 2
+        center_y = height // 2
+        corner_size = min(width, height) // 4
 
-        # Define regions to measure
-        center_size = min(width, height) // 8
-        corner_size = center_size  # Add this line, it was missing
+        # Extract center region
+        center_region = gray[
+            center_y - center_size//2:center_y + center_size//2,
+            center_x - center_size//2:center_x + center_size//2
+        ]
+        
+        # Calculate center intensity with outlier removal
+        center_values = center_region.flatten()
+        q1, q3 = np.percentile(center_values, [25, 75])
+        iqr = q3 - q1
+        center_mask = (center_values >= q1 - 1.5*iqr) & (center_values <= q3 + 1.5*iqr)
+        center_intensity = np.mean(center_values[center_mask])
 
-        # Center region coordinates
-        cx = width // 2
-        cy = height // 2
-
-        logging.info(f"Analyzing regions - center at ({cx}, {cy}), size: {center_size}")
-
-        # Get center region
-        center_y1 = max(0, cy - center_size // 2)
-        center_y2 = min(height, cy + center_size // 2)
-        center_x1 = max(0, cx - center_size // 2)
-        center_x2 = min(width, cx + center_size // 2)
-
-        center_region = gray[center_y1:center_y2, center_x1:center_x2]
-
-        # Define corner regions with bounds checking
+        # Extract and analyze corner regions
         corners = {
-            'top_left': gray[0:corner_size, 0:corner_size],
-            'top_right': gray[0:corner_size, width - corner_size:width],
-            'bottom_left': gray[height - corner_size:height, 0:corner_size],
-            'bottom_right': gray[height - corner_size:height, width - corner_size:width]
+            'top_left': gray[:corner_size, :corner_size],
+            'top_right': gray[:corner_size, -corner_size:],
+            'bottom_left': gray[-corner_size:, :corner_size],
+            'bottom_right': gray[-corner_size:, -corner_size:]
         }
 
-        # Calculate intensities
-        center_intensity = np.mean(center_region)
-        corner_intensities = {k: np.mean(v) for k, v in corners.items()}
+        # Calculate corner intensities with outlier removal
+        corner_intensities = {}
+        for corner_name, corner_region in corners.items():
+            values = corner_region.flatten()
+            q1, q3 = np.percentile(values, [25, 75])
+            iqr = q3 - q1
+            mask = (values >= q1 - 1.5*iqr) & (values <= q3 + 1.5*iqr)
+            corner_intensities[corner_name] = np.mean(values[mask])
 
-        # Calculate ratios (1.0 means no vignetting)
-        corner_ratios = {k: v / center_intensity for k, v in corner_intensities.items()}
+        # Calculate normalized ratios
+        corner_ratios = {k: min(max(v / center_intensity, 0.0), 2.0) 
+                        for k, v in corner_intensities.items()}
 
         # Calculate average corner ratio and score
         avg_corner_ratio = np.mean(list(corner_ratios.values()))
-        vignetting_score = avg_corner_ratio * 100
+        vignetting_score = min(100, avg_corner_ratio * 100)
 
         logging.info(f"Analysis complete - score: {vignetting_score:.2f}")
+        
+        # Generate visualization
         viz_path = os.path.join(
             os.path.dirname(image_path),
             f"vignette_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
@@ -476,9 +473,8 @@ def analyze_vignetting(image_path):
             'corner_ratios': {k: float(v) for k, v in corner_ratios.items()},
             'average_corner_ratio': float(avg_corner_ratio),
             'vignetting_score': float(vignetting_score),
-            'visualization_path': viz_path  # Make sure this is included
+            'visualization_path': viz_path
         }
-
 
     except Exception as e:
         logging.error(f"Analysis failed: {str(e)}")

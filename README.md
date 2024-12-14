@@ -32,7 +32,7 @@ The source code for this project is available on GitHub: [Clona Repository](http
 
 2. Create a virtual environment and activate it:
    ```bash
-   python -m venv venv
+   python3 -m venv venv
    source venv/bin/activate  # on Linux/Mac
    venv\Scripts\activate  # on Windows
    ```
@@ -42,14 +42,32 @@ The source code for this project is available on GitHub: [Clona Repository](http
    pip install -r requirements.txt
    ```
 
+4. Ensure `gphoto2` is installed and configured on your system:
+   ```bash
+   sudo apt-get install gphoto2  # on Debian-based systems
+   ```
+
 ## Usage
 
 1. Ensure your camera is connected via USB and is compatible with the GPhoto2 library.
-2. Run the main application:
+2. Verify the camera is recognized by running:
    ```bash
-   python main.py
+   gphoto2 --auto-detect
    ```
-3. Open your web browser and navigate to the local address provided by the NiceGUI server.
+3. Run the main application:
+   ```bash
+   python3 main.py
+   ```
+4. Open your web browser and navigate to the local address provided by the NiceGUI server.
+
+## Testing
+
+1. Navigate to the `repo/clona` directory.
+2. Run the tests using `pytest`:
+   ```bash
+   python3 -m pytest tests/test_camera_manager.py -v
+   ```
+3. Ensure the correct Python version is used (Python 3.x).
 
 ## File Structure
 

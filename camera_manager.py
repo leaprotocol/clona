@@ -6,19 +6,20 @@ import logging
 import time
 import exifread
 import io
+import os
 
 
 
 
 class CameraManager:
     def __init__(self):
+        self.context = gp.Context()
         self.camera = None
         self.camera_lock = Lock()
         self.connected = False
-        self.context = gp.Context()
-        self.lock_camera_connection = False
-        self._status_check_thread = None
         self._stop_status_check = False
+        self.honor_camera_settings = False
+        self.autofocus_enabled = True
 
     # camera_manager.py
 
@@ -88,21 +89,18 @@ class CameraManager:
 
     def wait_for_camera_ready(self, timeout=10):
         """Wait until camera is ready for I/O operations"""
-        # Note: This should be called before any camera operation
         start_time = time.time()
         ready = False
 
         while (time.time() - start_time) < timeout and not ready:
             try:
-                # Try to get a simple property - if it works, camera is ready
+                # Try to get camera config as a readiness test
                 config = self.camera.get_config()
-                OK, widget = gp.gp_widget_get_child_by_name(config, 'datetime')
-                if OK >= gp.GP_OK:
-                    ready = True
-                    break
-                time.sleep(2)  # Wait 2 seconds between checks
+                # If we can get the config, the camera is ready
+                ready = True
+                break
             except gp.GPhoto2Error as e:
-                if e.code == -110:  # GP_ERROR_IO_IN_PROGRESS
+                if e.code in [-110, -53]:  # Common error codes for busy camera
                     logging.debug("Camera busy, waiting...")
                     time.sleep(2)  # Wait 2 seconds before retry
                     continue
@@ -296,146 +294,105 @@ class CameraManager:
         # Execute the operation
         return operation_func(*args, **kwargs)
 
+    def set_honor_camera_settings(self, value):
+        """Set whether to honor existing camera settings"""
+        self.honor_camera_settings = value
+        logging.info(f"Honor camera settings: {value}")
+        
+    def set_autofocus_enabled(self, value):
+        """Set whether autofocus should be performed before capture"""
+        self.autofocus_enabled = value
+        logging.info(f"Autofocus enabled: {value}")
+        
     def capture_image(self, save_path):
-        """Capture an image and save it to specified path with metadata"""
+        """Modified capture_image method to respect new settings"""
         if not self.connected:
             logging.error("Cannot capture image: Camera not connected")
             return None
-
+            
         try:
-            if not self.camera_lock.acquire(timeout=5):
-                logging.error("Could not acquire camera lock")
-                return None
-
-            try:
-                # Wait for camera to be ready before capture
+            with self.camera_lock:
                 if not self.wait_for_camera_ready():
-                    logging.error("Camera not ready for capture")
                     return None
-
-                # Get all settings before capture
-                camera_settings = {}
-                config = self.camera.get_config()
-
-                # List of settings to capture with their correct paths
-                settings_to_get = [
-                    ('aperture', 'aperture'),
-                    ('iso', 'iso'),
-                    ('shutterspeed', 'shutterspeed'),
-                    ('cameramodel', 'camera_model'),
-                    ('lensname', 'lens_name'),
-                    ('focal_length', 'focal_length'),
-                    # These are alternative paths that might exist
-                    ('d01c', 'lens_name'),  # Some cameras use this for lens name
-                    ('d002', 'camera_model'),  # Some cameras use this for camera model
-                ]
-
-                for setting_name, result_key in settings_to_get:
-                    try:
-                        OK, widget = gp.gp_widget_get_child_by_name(config, setting_name)
-                        if OK >= gp.GP_OK:
-                            value = widget.get_value()
-                            if value:  # Only store if we got a value
-                                camera_settings[result_key] = value
-                                logging.debug(f"Got {result_key}: {value}")
-                    except Exception as e:
-                        logging.debug(f"Could not get {setting_name}: {e}")
-
-
-                # Try to get lens and camera info another way if not found
-                if 'lens_name' not in camera_settings:
-                    try:
-                        OK, summary = self.camera.get_summary()
-                        if OK >= gp.GP_OK:
-                            summary_text = str(summary)
-                            # Try to extract lens info from summary
-                            if 'Lens:' in summary_text:
-                                lens_line = [line for line in summary_text.split('\n') if 'Lens:' in line]
-                                if lens_line:
-                                    camera_settings['lens_name'] = lens_line[0].split('Lens:')[1].strip()
-                    except Exception as e:
-                        logging.debug(f"Could not get lens info from summary: {e}")
-
-                file_path = self.camera.capture(gp.GP_CAPTURE_IMAGE)
-
-                # Wait for camera to be ready before getting file
-                if not self.wait_for_camera_ready():
-                    logging.error("Camera not ready to retrieve file")
-                    return None
-
-                camera_file = self.camera.file_get(
-                    file_path.folder,
-                    file_path.name,
-                    gp.GP_FILE_TYPE_NORMAL
+                    
+                # Only modify camera settings if not honoring existing ones
+                if not self.honor_camera_settings:
+                    if self.autofocus_enabled and not self.autofocus_enabled:
+                        self.trigger_autofocus()
+                    
+                # Capture the image
+                file_path = self.do_camera_operation(self.camera.capture, gp.GP_CAPTURE_IMAGE)
+                
+                # Define where to save the image
+                target = os.path.join(save_path, file_path.name)
+                
+                # Get the camera file
+                camera_file = self.do_camera_operation(
+                    self.camera.file_get, file_path.folder, file_path.name, gp.GP_FILE_TYPE_NORMAL
                 )
-                # Get image data for EXIF reading
-                file_data = camera_file.get_data_and_size()
-
-
-                target = f"{save_path}/{file_path.name}"
+                
+                # Save the camera file to the target destination
                 camera_file.save(target)
-
-                # Get EXIF data
-                exif_data = self.get_focal_length_from_capture(file_data)
-
-                # Get current camera settings
-                camera_settings = self.get_current_settings()
-
-                # Merge EXIF data into camera settings, preferring EXIF values when available
-                if camera_settings is None:
-                    camera_settings = {}
-
-                # Override 'Auto' ISO with actual value from EXIF if available
-                if 'iso' in exif_data:
-                    camera_settings['iso'] = exif_data['iso']
-
-                if 'focal_length' in exif_data:
-                    camera_settings['focal_length'] = exif_data['focal_length']
-
-                # Add camera and lens info from EXIF
-                if 'camera_model' in exif_data:
-                    camera_settings['camera_model'] = exif_data['camera_model']
-                if 'lens_name' in exif_data:
-                    camera_settings['lens_name'] = exif_data['lens_name']
-
-                return {
-                    'path': target,
-                    'metadata': {
-                        'capture_time': datetime.now().isoformat(),
-                        'focal_length': exif_data.get('focal_length'),
-                        'focus_distance': exif_data.get('focus_distance'),
-                        'camera_settings': camera_settings
-                    }
-                }
-            finally:
-                self.camera_lock.release()
-        except Exception as e:
-            logging.error(f"Failed to capture image: {e}")
+                
+                # Fetch and save metadata
+                metadata = self.get_camera_settings()
+                
+                logging.info(f"Image captured and saved to {target}")
+                return {"path": target, "metadata": metadata}
+                
+        except gp.GPhoto2Error as e:
+            logging.error(f"Capture failed: {e}")
             return None
 
-
     def initialize_camera(self):
-        """Initialize camera connection"""
-        with self.camera_lock:
-            try:
-                self.camera = gp.Camera()
-                self.camera.init(self.context)
-
-                # Wait for camera to be ready after init
-                if not self.wait_for_camera_ready():
-                    logging.error("Camera not ready after initialization")
-                    self.camera = None
-                    self.connected = False
-                    return False
-
-                self.connected = True
-                logging.info("Camera initialized successfully")
-                return True
-            except gp.GPhoto2Error as e:
-                logging.error(f"Failed to initialize camera: {e}")
-                self.camera = None
-                self.connected = False
+        """Initialize the camera and set up configuration"""
+        try:
+            # First check if any cameras are detected
+            cameras = self.list_connected_cameras()
+            if not cameras:
+                logging.error("No cameras detected")
                 return False
+
+            logging.info(f"Detected cameras: {cameras}")
+            
+            # Initialize the camera
+            self.camera = gp.Camera()
+            
+            # Initialize the camera with the correct port
+            if 'port' in cameras[0]:
+                port_info_list = gp.PortInfoList()
+                port_info_list.load()
+                idx = port_info_list.lookup_path(cameras[0]['port'])
+                port_info = port_info_list[idx]
+                self.camera.set_port_info(port_info)
+            else:
+                logging.error("No port information available for the detected camera")
+                return False
+
+            # Check if camera is ready
+            self.connected = self.wait_for_camera_ready()
+            if not self.connected:
+                logging.error("Failed to initialize camera: Camera not ready")
+                return False
+            
+            # Get and log camera information
+            try:
+                summary = self.camera.get_summary()
+                logging.info(f"Camera initialized: {summary}")
+            except Exception as e:
+                logging.warning(f"Could not get camera summary: {e}")
+
+            logging.info("Camera initialized and ready")
+            return True
+            
+        except gp.GPhoto2Error as e:
+            logging.error(f"Failed to initialize camera: {e}")
+            self.connected = False
+            return False
+        except Exception as e:
+            logging.error(f"Unexpected error during camera initialization: {e}")
+            self.connected = False
+            return False
 
     def release_camera(self):
         """Release camera resources"""
@@ -520,3 +477,85 @@ class CameraManager:
         except gp.GPhoto2Error as e:
             logging.error(f"Failed to set {setting} to {value}: {e}")
             return False
+
+    def set_config_value(self, config_name, value):
+        """Set a camera config value"""
+        try:
+            if not self.connected:
+                logging.error("Camera not connected")
+                return
+
+            config = self.camera.get_config(self.context)
+            widget = config.get_child_by_name(config_name)
+
+            # Check if the widget is read-only
+            if widget.get_readonly():
+                logging.warning(f"Config '{config_name}' is read-only. Cannot be set to '{value}'.")
+                return
+
+            # Handle different widget types
+            if widget.get_type() == gp.GP_WIDGET_RADIO:
+                # Find the choice that matches the provided value
+                choice_found = False
+                for i in range(widget.count_choices()):
+                    choice = widget.get_choice(i)
+                    if choice.lower() == value.lower():
+                        widget.set_value(choice)
+                        choice_found = True
+                        break
+                if not choice_found:
+                    logging.warning(f"Value '{value}' not found in choices for '{config_name}'.")
+                    return
+            else:
+                widget.set_value(value)
+
+            self.camera.set_config(config, self.context)
+            logging.info(f"Set {config_name} to {value}")
+        except gp.GPhoto2Error as e:
+            logging.error(f"Failed to set {config_name} to {value}: {e}")
+
+    def get_camera_settings(self):
+        """Retrieve current camera settings"""
+        camera_settings = {}
+        try:
+            config = self.camera.get_config()
+
+            # List of settings to capture with their correct paths
+            settings_to_get = [
+                ('aperture', 'aperture'),
+                ('iso', 'iso'),
+                ('shutterspeed', 'shutter_speed'),
+                ('cameramodel', 'camera_model'),
+                ('lensname', 'lens_name'),
+                ('focal_length', 'focal_length'),
+            ]
+
+            for setting_name, result_key in settings_to_get:
+                try:
+                    OK, widget = gp.gp_widget_get_child_by_name(config, setting_name)
+                    if OK >= gp.GP_OK:
+                        value = widget.get_value()
+                        if value:  # Only store if we got a value
+                            camera_settings[result_key] = value
+                            logging.debug(f"Got {result_key}: {value}")
+                except Exception as e:
+                    logging.debug(f"Could not get {setting_name}: {e}")
+
+            # Try to get lens and camera info another way if not found
+            if 'lens_name' not in camera_settings:
+                try:
+                    OK, summary = self.camera.get_summary()
+                    if OK >= gp.GP_OK:
+                        summary_text = str(summary)
+                        # Try to extract lens info from summary
+                        if 'Lens:' in summary_text:
+                            lens_line = [line for line in summary_text.split('\n') if 'Lens:' in line]
+                            if lens_line:
+                                camera_settings['lens_name'] = lens_line[0].split('Lens:')[1].strip()
+                except Exception as e:
+                    logging.debug(f"Could not get lens info from summary: {e}")
+
+        except Exception as e:
+            logging.error(f"Error retrieving camera settings: {e}")
+
+        return camera_settings
