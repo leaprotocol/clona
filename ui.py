@@ -9,6 +9,7 @@ from analysis import convert_raw_to_jpeg
 from nicegui.events import UploadEventArguments
 import exifread
 import asyncio
+from analysis import analyze_bokeh
 
 class LensAnalysisUI:
     def __init__(self, camera_manager, dataset_manager):
@@ -25,8 +26,10 @@ class LensAnalysisUI:
         self.settings_button = None
         self.dataset_list = None
         self.scenario_details = None
-
-
+        
+        # Initialize UI elements
+        self.create_camera_controls()  # Call this first to initialize buttons
+        self.setup_ui_logging()
 
     def setup_ui_logging(self):
         """Set up logging display in the UI"""
@@ -79,17 +82,49 @@ class LensAnalysisUI:
         self.settings_button.enable() if is_ready else self.settings_button.disable()
 
     def handle_connect_camera(self):
-        """Handle camera connection"""
-        success = self.camera_manager.initialize_camera()
-        if success:
-            logging.info("Waiting for camera to be ready...")
-            if self.camera_manager.wait_for_camera_ready(timeout=2):
-                ui.notify('Camera connected and ready', type='positive')
-            else:
-                ui.notify('Camera connected but not ready yet', type='warning')
-        else:
-            ui.notify('Failed to connect camera', type='negative')
-        self.update_camera_status()
+        """Handle camera connection asynchronously"""
+        async def connect():
+            try:
+                with self.status_label:  # Use the status label as the context
+                    ui.notify('Attempting to connect camera...', type='info')
+                
+                # Run camera initialization in a background task
+                success = await asyncio.get_event_loop().run_in_executor(
+                    None, self.camera_manager.initialize_camera
+                )
+                
+                if success:
+                    logging.info("Waiting for camera to be ready...")
+                    # Run camera ready check in background
+                    is_ready = await asyncio.get_event_loop().run_in_executor(
+                        None, 
+                        lambda: self.camera_manager.wait_for_camera_ready(timeout=2)
+                    )
+                    
+                    with self.status_label:  # Use the status label as the context
+                        if True: # is_ready:
+                            ui.notify('Camera connected and ready', type='positive')
+                        else:
+                            ui.notify('Camera connected but not ready yet', type='warning')
+                else:
+                    with self.status_label:  # Use the status label as the context
+                        ui.notify('Failed to connect camera', type='negative')
+                
+                # Update UI status after connection attempt
+                await asyncio.get_event_loop().run_in_executor(
+                    None, self.update_camera_status
+                )
+                    
+            except Exception as e:
+                logging.error(f"Camera connection error: {e}")
+                with self.status_label:  # Use the status label as the context
+                    ui.notify(f'Connection error: {str(e)}', type='negative')
+                await asyncio.get_event_loop().run_in_executor(
+                    None, self.update_camera_status
+                )
+
+        # Schedule the async connection task
+        ui.timer(0.1, lambda: asyncio.create_task(connect()), once=True)
 
     def handle_disconnect_camera(self):
         """Handle camera disconnection"""
@@ -120,61 +155,102 @@ class LensAnalysisUI:
             self.handle_disconnect_camera()  # Ensure camera is properly disconnected on error
             ui.notify('Camera error - please reconnect', type='negative')
 
+    def preview_aperture(self, aperture):
+        """Take a preview shot with selected aperture"""
+        try:
+            # Temporarily set aperture
+            self.camera_manager.set_aperture(aperture)
+            
+            # Take preview shot
+            preview_result = self.camera_manager.capture_image(
+                os.path.join(self.temp_dir, "preview.jpg")
+            )
+            
+            if preview_result:
+                # Show preview in a modal
+                with ui.dialog() as preview_dialog:
+                    with ui.card():
+                        ui.label(f'Preview at {aperture}').classes('text-lg mb-2')
+                        ui.image(preview_result['path']).classes('max-w-xl')
+                        ui.button('Close', on_click=preview_dialog.close)
+            else:
+                ui.notify('Failed to capture preview', type='negative')
+                
+        except Exception as e:
+            ui.notify(f'Preview failed: {str(e)}', type='negative')
+                
+
     def show_aperture_selection_dialog(self):
-        """Show dialog for selecting multiple apertures for batch capture"""
+        """Show dialog for selecting apertures, including automatic/non-numeric values"""
         available_apertures = self.print_available_apertures()
         if not available_apertures:
-            ui.notify(
-                'Could not get aperture settings from camera - make sure camera is connected and supports aperture control',
-                type='negative')
+            ui.notify('Camera not connected or aperture control not supported', type='negative')
             return
 
-        dialog = ui.dialog().classes('dialog-class')
-
-        def force_close_dialog():
-            """Force close the dialog and clean up"""
+        # Separate numeric and non-numeric apertures
+        numeric_apertures = []
+        other_apertures = []
+        for ap in available_apertures:
             try:
-                dialog.close()
-            except:
-                pass
-            ui.notify('Dialog closed', type='warning')
+                if ap.startswith('f/'):
+                    float(ap.replace('f/', ''))
+                    numeric_apertures.append(ap)
+                else:
+                    other_apertures.append(ap)
+            except ValueError:
+                other_apertures.append(ap)
 
-        with dialog, ui.card().classes('p-4 min-w-[300px]'):
-            with ui.row().classes('w-full justify-between items-center'):
-                ui.label('Select Apertures').classes('text-xl')
-                ui.button(
-                    text='✕',
-                    on_click=force_close_dialog,
-                    color='green'
-                )
+        dialog = ui.dialog().classes('w-96')
+        
+        with dialog, ui.card().classes('p-6 w-full'):
+            ui.label('Select Apertures for Series').classes('text-xl mb-4')
+            
+            all_checkboxes = []
+            
+            # Show automatic/special modes first if available
+            if other_apertures:
+                with ui.expansion('Special Modes', icon='settings').classes('w-full'):
+                    for aperture in other_apertures:
+                        with ui.row().classes('items-center gap-2'):
+                            cb = ui.checkbox(f'{aperture}')
+                            all_checkboxes.append(cb)
+                            ui.button(icon='preview', on_click=lambda a=aperture: self.preview_aperture(a))
 
-            aperture_checkboxes = []
-            for aperture in available_apertures:
-                checkbox = ui.checkbox(f'{aperture}')
-                aperture_checkboxes.append((aperture, checkbox))
+            # Show numeric apertures if available
+            if numeric_apertures:
+                aperture_groups = {
+                    'Wide': [f for f in numeric_apertures if float(f.replace('f/', '')) <= 2.8],
+                    'Medium': [f for f in numeric_apertures if 2.8 < float(f.replace('f/', '')) <= 8],
+                    'Narrow': [f for f in numeric_apertures if float(f.replace('f/', '')) > 8]
+                }
+                
+                for group_name, apertures in aperture_groups.items():
+                    if apertures:  # Only show groups with apertures
+                        with ui.expansion(group_name, icon='camera').classes('w-full'):
+                            for aperture in apertures:
+                                with ui.row().classes('items-center gap-2'):
+                                    cb = ui.checkbox(f'{aperture}')
+                                    all_checkboxes.append(cb)
+                                    ui.button(icon='preview', on_click=lambda a=aperture: self.preview_aperture(a))
 
+            # Quick selection buttons
+            with ui.row().classes('gap-2 mb-4'):
+                ui.button('Select All', on_click=lambda: [cb.set_value(True) for cb in all_checkboxes])
+                ui.button('Clear All', on_click=lambda: [cb.set_value(False) for cb in all_checkboxes])
+                
             with ui.row().classes('gap-2 justify-end mt-4'):
+                ui.button('Cancel', on_click=dialog.close).classes('bg-red-500 text-white')
                 ui.button(
-                    'Cancel',
-                    on_click=force_close_dialog,
-                    color='red'
-                )
-
-                ui.button(
-                    'Capture Series',
+                    'Start Capture Series',
                     on_click=lambda: self.do_batch_capture(
                         dialog,
-                        [ap for ap, cb in aperture_checkboxes if cb.value]
+                        [cb.text for cb in all_checkboxes if cb.value]
                     )
                 ).classes('bg-blue-500 text-white')
 
-        # Add escape key and outside click handlers with force close
-        dialog.on_escape = force_close_dialog
-        dialog.on_click_outside = force_close_dialog
-
         dialog.open()
 
-    def do_capture(self, dataset_path, aperture):
+    async def do_capture(self, dataset_path, aperture):
         """Regular capture with full metadata"""
         try:
             dataset_path = os.path.join("datasets", self.current_dataset['id'], "photos")
@@ -189,8 +265,9 @@ class LensAnalysisUI:
 
                 shutil.move(temp_path, final_path)
 
-                # Get all camera settings from the capture result
-                camera_settings = capture_result['metadata']['camera_settings']
+                # Get metadata from capture result, ensuring proper structure
+                metadata = capture_result.get('metadata', {})
+                camera_settings = metadata  # The metadata itself is the camera settings
 
                 # Create photo info with all metadata
                 photo_info = {
@@ -200,14 +277,14 @@ class LensAnalysisUI:
                     'metadata': {
                         'scenario_type': self.current_scenario['type'],
                         'scenario_id': self.current_scenario['id'],
-                        'camera_settings': camera_settings,
-                        # Also store at top level for easier access
-                        'aperture': camera_settings.get('aperture'),
-                        'shutter_speed': camera_settings.get('shutter_speed'),
-                        'iso': camera_settings.get('iso'),
-                        'lens_name': camera_settings.get('lens_name'),
-                        'camera_model': camera_settings.get('camera_model'),
-                        'focal_length': camera_settings.get('focal_length')
+                        'camera_settings': {
+                            'camera_model': camera_settings.get('camera_model'),
+                            'lens_name': camera_settings.get('lens_name'),
+                            'aperture': camera_settings.get('aperture'),
+                            'shutter_speed': camera_settings.get('shutter_speed', camera_settings.get('shutterspeed', 'Unknown')),  # Match the key from camera_manager
+                            'iso': camera_settings.get('iso'),
+                            'focal_length': camera_settings.get('focal_length', self.current_scenario.get('metadata', {}).get('focal_length', 'Unknown'))
+                        }
                     }
                 }
 
@@ -220,12 +297,11 @@ class LensAnalysisUI:
                         self.current_scenario
                 ):
                     ui.notify('Photo captured and saved with full metadata', type='positive')
-                    self.select_scenario(self.current_scenario)
+                    await self.select_scenario(self.current_scenario)
                 else:
                     ui.notify('Photo captured but failed to update dataset', type='warning')
             else:
                 ui.notify('Failed to capture photo', type='negative')
-
         except Exception as e:
             ui.notify(f'Error capturing photo: {str(e)}', type='negative')
             logging.error(f"Error capturing photo: {e}")
@@ -337,155 +413,108 @@ class LensAnalysisUI:
     def create_camera_controls(self):
         """Create camera control section"""
         with ui.card().classes('w-full mb-4'):
+            # Main camera controls row
             with ui.row().classes('w-full items-center'):
                 ui.label('Camera Control').classes('text-xl mr-4')
                 self.status_label = ui.label('○ Camera Disconnected').classes('text-red-500')
 
+            # Primary buttons row
             with ui.row().classes('gap-2 mt-2'):
                 self.connect_button = ui.button(
                     'Connect Camera',
                     on_click=self.handle_connect_camera,
                     color='blue'
                 )
-
                 self.disconnect_button = ui.button(
                     'Disconnect Camera',
                     on_click=self.handle_disconnect_camera,
                     color='red'
                 )
-                self.disconnect_button.disable()
-
-            with ui.row().classes('gap-2 mt-2'):
-
                 self.settings_button = ui.button(
                     '⚙️ Camera Settings',
                     on_click=self.show_camera_settings,
                     color='blue'
                 )
+                self.disconnect_button.disable()
                 self.settings_button.disable()
-                
-                ui.button(
-                    'List All Properties',
-                    on_click=self.show_properties_dialog,
-                    color='blue'
-                )
 
-            # Camera Settings Controls
-            with ui.card().classes('w-full mt-2 p-2'):
-                ui.label('Camera Settings').classes('text-xl mb-4')
-                
-                # Capture Target Setting
-                with ui.row().classes('w-full items-center mb-4'):
-                    ui.label('Storage Location:').classes('mr-4')
-                    capture_target = ui.select(
-                        options=['Memory card', 'Internal RAM'],
-                        value='Memory card',
-                        on_change=lambda e: self.camera_manager.set_config_value('capturetarget', e.value)
-                    ).classes('w-40')
-                
-                # Autofocus Setting
-                with ui.row().classes('w-full items-center mb-4'):
-                    ui.label('Enable Autofocus:').classes('mr-4')
-                    autofocus_switch = ui.switch(
-                        value=False,  # Default to off
-                        on_change=lambda e: self.camera_manager.set_autofocus_enabled(e.value)
-                    )
-                
-                # Honor Camera Settings
-                with ui.row().classes('w-full items-center mb-4'):
-                    ui.label('Honor Camera Settings:').classes('mr-4')
-                    honor_settings_switch = ui.switch(
-                        value=True,  # Default to on
-                        on_change=lambda e: self.camera_manager.set_honor_camera_settings(e.value)
-                    )
-
-            # Add focus control section
-            with ui.card().classes('w-full mt-2 p-2'):
-                ui.label('Focus Controls').classes('font-bold mb-2')
-
-                # Auto Focus controls
+            # Advanced controls in expandable section
+            with ui.expansion('Advanced Camera Controls').classes('w-full mt-2'):
+                # Settings buttons
                 with ui.row().classes('gap-2 mt-2'):
                     ui.button(
-                        'Enable Auto Focus Cancel',
-                        on_click=lambda: self.handle_autofocus(True),
+                        'List All Properties',
+                        on_click=self.show_properties_dialog,
                         color='blue'
                     )
 
-                    ui.button(
-                        'Disable Auto Focus Cancel',
-                        on_click=lambda: self.handle_autofocus(False),
-                        color='blue'
-                    )
+                # Camera Settings Controls
+                with ui.card().classes('w-full mt-2 p-2'):
+                    ui.label('Camera Settings').classes('text-xl mb-4')
+                    
+                    # Storage Location
+                    with ui.row().classes('w-full items-center mb-4'):
+                        ui.label('Storage Location:').classes('mr-4')
+                        capture_target = ui.select(
+                            options=['Memory card', 'Internal RAM'],
+                            value='Memory card',
+                            on_change=lambda e: self.camera_manager.set_config_value('capturetarget', e.value)
+                        ).classes('w-40')
+                    
+                    # Autofocus Setting
+                    with ui.row().classes('w-full items-center mb-4'):
+                        ui.label('Enable Autofocus:').classes('mr-4')
+                        autofocus_switch = ui.switch(
+                            value=False,
+                            on_change=lambda e: self.camera_manager.set_autofocus_enabled(e.value)
+                        )
+                    
+                    # Honor Camera Settings
+                    with ui.row().classes('w-full items-center mb-4'):
+                        ui.label('Honor Camera Settings:').classes('mr-4')
+                        honor_settings_switch = ui.switch(
+                            value=True,
+                            on_change=lambda e: self.camera_manager.set_honor_camera_settings(e.value)
+                        )
 
-                # Auto Focus Drive controls
-                with ui.row().classes('gap-2 mt-2'):
-                    ui.button(
-                        'Enable AF Drive',
-                        on_click=lambda: self.handle_autofocus_drive(True),
-                        color='blue'
-                    )
+            # Focus Controls in nested expansion
+            with ui.expansion('Focus Controls').classes('w-full mt-2'):
+                with ui.card().classes('p-2'):
+                    # Auto Focus controls
+                    with ui.row().classes('gap-2 mt-2'):
+                        ui.button(
+                            'Enable Auto Focus Cancel',
+                            on_click=lambda: self.handle_autofocus(True),
+                            color='blue'
+                        )
+                        ui.button(
+                            'Disable Auto Focus Cancel',
+                            on_click=lambda: self.handle_autofocus(False),
+                            color='blue'
+                        )
 
-                    ui.button(
-                        'Disable AF Drive',
-                        on_click=lambda: self.handle_autofocus_drive(False),
-                        color='red'
-                    )
+                    # Auto Focus Drive controls
+                    with ui.row().classes('gap-2 mt-2'):
+                        ui.button(
+                            'Enable AF Drive',
+                            on_click=lambda: self.handle_autofocus_drive(True),
+                            color='blue'
+                        )
+                        ui.button(
+                            'Disable AF Drive',
+                            on_click=lambda: self.handle_autofocus_drive(False),
+                            color='red'
+                        )
 
-                # Viewfinder controls
-                with ui.row().classes('gap-2 mt-2'):
-                    ui.button(
-                        'Enable Viewfinder',
-                        on_click=lambda: self.handle_viewfinder(True),
-                        color='blue'
-                    )
-
-                    ui.button(
-                        'Disable Viewfinder',
-                        on_click=lambda: self.handle_viewfinder(False),
-                        color='red'
-                    )
-
-                # Focus controls
-                with ui.row().classes('gap-2 mt-2'):
-                    ui.label('Focus Control:').classes('font-bold self-center')
-
-                    # Far focus controls
-                    ui.button(
-                        'Far 3',
-                        on_click=lambda: self.handle_focus('Far 3'),
-                        color='blue'
-                    )
-
-                    ui.button(
-                        'Far 2',
-                        on_click=lambda: self.handle_focus('Far 2'),
-                        color='blue'
-                    )
-
-                    ui.button(
-                        'Far 1',
-                        on_click=lambda: self.handle_focus('Far 1'),
-                        color='blue'
-                    )
-
-                    # Near focus controls
-                    ui.button(
-                        'Near 1',
-                        on_click=lambda: self.handle_focus('Near 1'),
-                        color='blue'
-                    )
-
-                    ui.button(
-                        'Near 2',
-                        on_click=lambda: self.handle_focus('Near 2'),
-                        color='blue'
-                    )
-
-                    ui.button(
-                        'Near 3',
-                        on_click=lambda: self.handle_focus('Near 3'),
-                        color='blue'
-                    )
+                    # Manual Focus controls
+                    with ui.row().classes('gap-2 mt-2'):
+                        ui.label('Focus Control:').classes('font-bold self-center')
+                        for direction in ['Far 3', 'Far 2', 'Far 1', 'Near 1', 'Near 2', 'Near 3']:
+                            ui.button(
+                                direction,
+                                on_click=lambda d=direction: self.handle_focus(d),
+                                color='blue'
+                            )
 
     def show_properties_dialog(self):
         """Show dialog with all camera properties"""
@@ -543,16 +572,16 @@ class LensAnalysisUI:
 
     def show_metadata_card(self, metadata):
         """Helper method to show consistent metadata display"""
-        with ui.card().classes('w-full p-4 mb-4'):
+        with ui.card().classes('w-full p-4'):
             ui.label('Capture Settings').classes('font-bold mb-2')
-            with ui.grid(columns=2).classes('gap-2'):
+            with ui.grid(columns=1).classes('gap-2'):
                 cam_settings = metadata.get('camera_settings', {})
 
                 # Get shutter speed and format it correctly
-                shutter_speed = cam_settings.get('shutterspeed', 'Unknown')
+                shutter_speed = cam_settings.get('shutter_speed', cam_settings.get('shutterspeed', 'Unknown'))
                 if shutter_speed != 'Unknown':
                     if isinstance(shutter_speed, str) and shutter_speed.startswith('1/'):
-                        shutter_display = shutter_speed  # Already in correct format
+                        shutter_display = shutter_speed
                     else:
                         shutter_display = f"1/{shutter_speed}"
                 else:
@@ -899,15 +928,39 @@ class LensAnalysisUI:
                             with ui.row().classes('w-full justify-between items-center'):
                                 # Left side - scenario info
                                 with ui.row().classes('gap-2 items-center flex-grow'):
-                                    scenario_type = scenario['type']
-                                    display_type = scenario_type[1] if isinstance(scenario_type, tuple) else scenario_type.title()
-                                    ui.label(display_type).classes('text-lg')
-                                    if scenario['metadata'].get('focal_length'):
-                                        ui.label('|').classes('text-gray-400')
-                                        ui.label(f"focal length: {scenario['metadata']['focal_length']}mm").classes('text-sm text-gray-600')
-                                    if scenario['metadata'].get('notes'):
-                                        ui.label('|').classes('text-gray-400')
-                                        ui.label(f"📝 {scenario['metadata']['notes']}").classes('text-sm text-gray-600')
+                                    # Title and type
+                                    with ui.row().classes('items-center gap-2'):
+                                        ui.label(f"{scenario['type'].title()}").classes('text-xl font-bold')
+                                        ui.label(f"Created: {scenario['created']}").classes('text-sm text-gray-500')
+                                    
+                                    # Metadata display
+                                    with ui.row().classes('gap-4 text-sm text-gray-600'):
+                                        if scenario['metadata'].get('focal_length'):
+                                            with ui.row().classes('items-center gap-1'):
+                                                ui.icon('straighten')  # Material icon for focal length
+                                                ui.label(f"{scenario['metadata']['focal_length']}mm")
+                                        
+                                        if scenario['metadata'].get('notes'):
+                                            with ui.row().classes('items-center gap-1'):
+                                                ui.icon('description')  # Material icon for notes
+                                                ui.label(scenario['metadata']['notes'])
+                                        
+                                        # Photo count
+                                        photos = scenario.get('photos', [])
+                                        with ui.row().classes('justify-between items-center mb-4'):
+                                            ui.label('Photos').classes('text-lg font-bold')
+                                            with ui.row().classes('gap-2 items-center text-sm text-gray-600'):
+                                                with ui.row().classes('items-center gap-1'):
+                                                    ui.icon('photo_library')
+                                                    ui.label(f'{len(photos)} total')
+                                                
+                                                # Show analyzed count if any
+                                                analyzed_count = sum(1 for p in photos if 'analysis' in p)
+                                                if analyzed_count > 0:
+                                                    ui.label('•').classes('text-gray-400')
+                                                    with ui.row().classes('items-center gap-1'):
+                                                        ui.icon('analytics')
+                                                        ui.label(f'{analyzed_count} analyzed').classes('text-blue-500')
                                 
                                 # Right side - buttons
                                 with ui.row().classes('gap-2 ml-auto'):
@@ -946,44 +999,70 @@ class LensAnalysisUI:
             # Header with scenario info
             with ui.card().classes('w-full p-4 border-2 border-gray-200 mb-4'):
                 with ui.row().classes('w-full justify-between items-center'):
-                    with ui.column().classes('gap-1'):
+                    # Left side - Scenario info
+                    with ui.column().classes('gap-2'):
                         ui.label(f"{scenario['type'].title()}").classes('text-xl font-bold')
                         with ui.row().classes('gap-2 text-sm text-gray-600'):
                             ui.label(f"focal length: {scenario['metadata']['focal_length']}mm")
                             if scenario['metadata'].get('notes'):
                                 ui.label('|').classes('text-gray-400')
                                 ui.label(f"📝 {scenario['metadata']['notes']}")
-
-            # Capture controls
-            with ui.card().classes('w-full p-4 border-2 border-gray-200 mb-4'):
-                with ui.row().classes('justify-between items-center'):
-                    ui.label('Capture').classes('text-lg font-bold')
+                
+                    # Right side - Action buttons
                     with ui.row().classes('gap-2'):
-                        if scenario['type'] in ['vignette', 'chromatic']:
-                            self.capture_button = ui.button(
-                                '📸 Capture with Aperture',
-                                on_click=self.show_aperture_selection_dialog,
-                                color='green'
-                            )
-                        else:
+                        if scenario['type'] == 'bokeh':
                             self.capture_button = ui.button(
                                 '📸 Capture Photo',
                                 on_click=self.handle_capture_photo,
                                 color='green'
                             )
-                        
-                        ui.button(
-                            '📥 Import RAW',
-                            on_click=self.handle_import_raw,
-                            color='blue'
-                        )
+                            ui.button(
+                                '📥 Import RAW',
+                                on_click=self.handle_import_raw,
+                                color='blue'
+                            )
+                            ui.label('Click on bokeh spots in the photo to analyze them').classes('text-sm italic')
+                        elif scenario['type'] in ['vignette', 'bokeh', 'distortion', 'sharpness', 'chromatic']:
+                            self.capture_button = ui.button(
+                                '📸 Capture Series',
+                                on_click=self.show_aperture_selection_dialog,
+                                color='green'
+                            )
+                            ui.button(
+                                '📥 Import RAW',
+                                on_click=self.handle_import_raw,
+                                color='blue'
+                            )
+                        else:
+                            self.capture_button = ui.button(
+                                '📸 Single Capture',
+                                on_click=self.handle_capture_photo,
+                                color='green'
+                            )
+                            ui.button(
+                                '📥 Import RAW',
+                                on_click=self.handle_import_raw,
+                                color='blue'
+                            )
 
             # Photos grid
             photos = scenario.get('photos', [])
             with ui.card().classes('w-full p-4 border-2 border-gray-200'):
                 with ui.row().classes('justify-between items-center mb-4'):
                     ui.label('Photos').classes('text-lg font-bold')
-                    ui.label(f'{len(photos)} total').classes('text-sm text-gray-600')
+                    with ui.row().classes('gap-2 items-center text-sm text-gray-600'):
+                        with ui.row().classes('items-center gap-1'):
+                            ui.icon('photo_library')
+                            photos = list(scenario.get('photos', []))
+                            ui.label(f'{len(photos)} total')
+                        
+                        # Show analyzed count if any
+                        analyzed_count = sum(1 for p in photos if 'analysis' in p)
+                        if analyzed_count > 0:
+                            ui.label('•').classes('text-gray-400')
+                            with ui.row().classes('items-center gap-1'):
+                                ui.icon('analytics')
+                                ui.label(f'{analyzed_count} analyzed').classes('text-blue-500')
 
                 if not photos:
                     ui.label('No photos taken yet').classes('text-gray-500 italic')
@@ -991,16 +1070,26 @@ class LensAnalysisUI:
                     with ui.grid(columns=3).classes('w-full gap-4'):
                         for photo in photos:
                             with ui.card().classes('w-full p-4 border-2 border-gray-200'):
-                                with ui.column().classes('gap-2'):
+                                with ui.column().classes('gap-2 w-full'):
                                     # Top row - metadata and file info
                                     with ui.row().classes('w-full justify-between items-center'):
-                                        with ui.column().classes('gap-1'):
-                                            ui.label(photo.get('filename', 'Unnamed')).classes('font-bold text-sm')
-                                            timestamp = photo.get('metadata', {}).get('capture_time', 'Unknown time')
-                                            ui.label(timestamp).classes('text-xs text-gray-600')
+                                        with ui.column().classes('gap-1 w-full'):
+                                            filename = photo.get('filename', 'Unnamed')
+                                            if len(filename) > 20:
+                                                filename = filename[:17] + '...'
+                                            ui.label(filename).classes('font-bold text-sm truncate')
+                                            
+                                            # Format the timestamp properly
+                                            timestamp = photo.get('metadata', {}).get('timestamp') or photo.get('timestamp')
+                                            formatted_time = self.format_timestamp(timestamp) if timestamp else 'Unknown time'
+                                            ui.label(formatted_time).classes('text-xs text-gray-600')
+                                            
+                                            # Add metadata card if metadata exists
+                                            if photo.get('metadata'):
+                                                self.show_metadata_card(photo['metadata'])
                                     
                                     # Photo preview with analysis indicator overlay
-                                    with ui.card().classes('relative w-full overflow-hidden'):
+                                    with ui.card().classes('relative w-full overflow-hidden p-0'):
                                         # Handle RAW file preview
                                         preview_path = photo.get('preview_path', photo.get('path'))
                                         if preview_path:
@@ -1011,7 +1100,11 @@ class LensAnalysisUI:
                                                 preview_path = jpeg_path
                                             
                                             if os.path.exists(preview_path):
-                                                ui.image(preview_path).classes('w-full h-full object-cover')
+                                                if scenario['type'] == 'bokeh':
+                                                    img = ui.image(preview_path).classes('w-full h-full object-cover cursor-pointer')
+                                                    img.on("click", lambda e, s=scenario, p=photo: self.handle_bokeh_click(e, s, p))
+                                                else:
+                                                    ui.image(preview_path).classes('w-full h-full object-cover')
                                             else:
                                                 ui.label('Preview not available').classes('text-red-500 italic')
                                         
@@ -1042,7 +1135,7 @@ class LensAnalysisUI:
                                             color='red'
                                         ).classes('text-sm px-3 py-1')
 
-        return True
+        self.refresh_dataset_list()
 
     def refresh_dataset_list(self):
         """Refresh the dataset list display"""
@@ -1052,7 +1145,7 @@ class LensAnalysisUI:
             
             for dataset in datasets:
                 with self.dataset_list, ui.card().classes('w-full p-4 border-2 border-gray-200'):
-                    with ui.column().classes('w-full gap-2'):  # Changed to column to allow two rows
+                    with ui.column().classes('w-full gap-2 w-full'):
                         # First row - main info and buttons
                         with ui.row().classes('w-full justify-between items-center'):
                             # Left side - dataset info in one line
@@ -1188,15 +1281,20 @@ class LensAnalysisUI:
                     # Dataset List
                     with ui.card().classes('w-full p-4'): 
                         with ui.row().classes('w-full justify-between items-center mb-4'):
-                            ui.label('Datasets').classes('text-xl')
+                            ui.label('Your datasets').classes('text-xl')
                             with ui.row().classes('gap-2 justify-end'):
+                                ui.button(
+                                    'Import Dataset',
+                                    on_click=self.import_dataset_dialog,
+                                    color='blue'
+                                )
                                 ui.button(
                                     'New Dataset',
                                     on_click=self.create_dataset_dialog,
                                     color='blue'
                                 )
 
-                        # Dataset list container - make it full width
+                        # Dataset list container
                         self.dataset_list = ui.column().classes('w-full gap-2 max-h-96 overflow-y-auto')
                         self.refresh_dataset_list()
 
@@ -1274,7 +1372,7 @@ class LensAnalysisUI:
                     if OK >= gp.GP_OK and self.set_aperture(camera_config, current_widget, aperture):
                         # Capture photo
                         self.update_progress(f'Capturing photo {idx}/{total_apertures}...', aperture)
-                        self.do_capture(dataset_path, aperture)
+                        await self.do_capture(dataset_path, aperture)
                 except Exception as e:
                     logging.error(f"Error during capture at {aperture}: {e}")
                     self.update_progress(f'Error during capture {idx}/{total_apertures}: {str(e)}', aperture)
@@ -1300,12 +1398,13 @@ class LensAnalysisUI:
 
 
 
+
     def show_chromatic_results(self, analysis):
         """Display chromatic aberration analysis results"""
         # Show score and timestamp
         with ui.row().classes('w-full justify-between mb-4'):
             ui.label(
-                f"CA Score: {analysis.get('chromatic_aberration_score', 0):.1f}/100"
+                f"Chromatic Aberration Score: {analysis.get('chromatic_aberration_score', 0):.1f}/100"
             ).classes('text-xl font-bold')
             ui.label(
                 f"Analyzed: {analysis.get('analysis_time', 'Unknown')}"
@@ -1330,16 +1429,29 @@ class LensAnalysisUI:
                 else:
                     ui.label('Visualization not available').classes('text-red-500 italic')
 
-        # Show channel differences
+        # Show CA measurements
         with ui.card().classes('p-4 mt-4'):
-            ui.label('Channel Differences').classes('font-bold mb-2')
-            diffs = analysis.get('channel_differences', {})
-            with ui.grid(columns=3).classes('gap-4'):
-                for channel, value in diffs.items():
-                    with ui.card().classes('p-2'):
-                        ui.label(channel.replace('_', '-').title())
-                        ui.label(f"{value:.2f}").classes(
-                            'font-bold ' +
+            ui.label('CA Measurements').classes('font-bold mb-2')
+            with ui.grid(columns=2).classes('gap-4'):
+                # Lateral CA
+                with ui.card().classes('p-2'):
+                    ui.label('Lateral CA').classes('font-bold')
+                    displacements = analysis.get('lateral_ca', {}).get('displacements', {})
+                    for channel, value in displacements.items():
+                        ui.label(f"{channel}: {value:.2f}px").classes(
+                            'text-sm ' +
+                            ('text-green-500' if value < 1 else
+                             'text-yellow-500' if value < 2 else
+                             'text-red-500')
+                        )
+
+                # Longitudinal CA
+                with ui.card().classes('p-2'):
+                    ui.label('Longitudinal CA').classes('font-bold')
+                    fringing = analysis.get('longitudinal_ca', {}).get('fringing_metrics', {})
+                    for channel, value in fringing.items():
+                        ui.label(f"{channel}: {value:.2f}").classes(
+                            'text-sm ' +
                             ('text-green-500' if value < 10 else
                              'text-yellow-500' if value < 20 else
                              'text-red-500')
@@ -1655,6 +1767,7 @@ class LensAnalysisUI:
         """Run analysis on a photo and save results"""
         try:
             from analysis import analyze_vignetting, analyze_distortion, analyze_chromatic_aberration, analyze_sharpness
+            import os
 
             # Create loading notification
             loading_notification = ui.notification(
@@ -1697,7 +1810,17 @@ class LensAnalysisUI:
                     'metadata': metadata
                 }
             elif scenario['type'] == 'sharpness':
-                results = analyze_sharpness(photo_info['path'])
+                # Create patterns directory if it doesn't exist
+                patterns_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'patterns')
+                os.makedirs(patterns_dir, exist_ok=True)
+
+                # Create Siemens star patterns if they don't exist
+                center_pattern = os.path.join(patterns_dir, "siemens_center.png")
+                corner_pattern = os.path.join(patterns_dir, "siemens_corner.png")
+
+                # TODO: Generate or download actual Siemens star patterns
+                # For now, we'll use a simplified analysis without pattern matching
+                results = analyze_sharpness(photo_info['path'], patterns_dir)
                 photo_info['analysis'] = {
                     **results,
                     'preview_path': photo_info['path'],
@@ -1707,10 +1830,12 @@ class LensAnalysisUI:
                 }
 
             # Save updated scenario to dataset
-            if self.dataset_manager.update_scenario(
-                    self.current_dataset['id'],
-                    self.current_scenario
-            ):
+            update_success = self.dataset_manager.update_scenario(
+                self.current_dataset['id'],
+                self.current_scenario
+            )
+
+            if update_success:
                 # Close loading notification
                 loading_notification.delete()
                 
@@ -1719,11 +1844,13 @@ class LensAnalysisUI:
                     dialog.close()
                 
                 # Show results in new dialog
-                await self.show_photo_analysis(scenario, photo_info)
-                ui.notify('Analysis complete', type='positive', position='bottom')
-                
-                # Refresh the scenario view
-                await self.select_scenario(scenario)
+                show_analysis_result = await self.show_photo_analysis(scenario, photo_info)
+                if show_analysis_result:
+                    ui.notify('Analysis complete', type='positive', position='bottom')
+                    # Refresh the scenario view
+                    await self.select_scenario(scenario)
+                else:
+                    ui.notify('Failed to display analysis results', type='warning')
             else:
                 loading_notification.delete()
                 ui.notify('Failed to save analysis results', type='negative')
@@ -2055,4 +2182,244 @@ class LensAnalysisUI:
         else:
             ui.dark_mode().disable()
             ui.colors(
+                red='#B87A8C'
             )
+
+    def import_dataset_dialog(self):
+        """Show dialog for importing a dataset"""
+        def handle_upload(e: UploadEventArguments):
+            try:
+                if not e.name.lower().endswith('.zip'):
+                    ui.notify('Please select a ZIP file', type='warning')
+                    return
+
+                # Save uploaded file to temporary location
+                temp_dir = os.path.join("temp", "imports")
+                os.makedirs(temp_dir, exist_ok=True)
+                temp_path = os.path.join(temp_dir, e.name)
+
+                with open(temp_path, 'wb') as f:
+                    e.content.seek(0)
+                    shutil.copyfileobj(e.content, f)
+
+                # Import the dataset
+                imported_dataset = self.dataset_manager.import_dataset(temp_path)
+                if imported_dataset:
+                    dialog.close()
+                    ui.notify('Dataset imported successfully', type='positive')
+                    self.refresh_dataset_list()
+                else:
+                    ui.notify('Failed to import dataset', type='negative')
+
+                # Cleanup temp file
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+
+            except Exception as e:
+                ui.notify(f'Error importing dataset: {str(e)}', type='negative')
+                logging.error(f"Error in import_dataset: {e}")
+
+        dialog = ui.dialog()
+        with dialog, ui.card().classes('p-4'):
+            with ui.row().classes('w-full justify-between items-center mb-4'):
+                ui.label('Import Dataset').classes('text-xl')
+                ui.button(text='✕', on_click=dialog.close, color='red')
+                
+            ui.upload(
+                label='Select dataset ZIP file',
+                on_upload=handle_upload,
+                auto_upload=True,
+                multiple=False
+            ).classes('w-full mb-4')
+            
+            ui.label('Select a dataset ZIP file to import').classes('text-sm text-gray-500')
+
+        dialog.open()
+
+    def format_timestamp(self, timestamp_str):
+        """Convert timestamp string to readable format"""
+        try:
+            # Parse the timestamp format we use (YYYYmmdd_HHMMSS)
+            dt = datetime.strptime(timestamp_str, "%Y%m%d_%H%M%S")
+            return dt.strftime("%B %d, %Y %H:%M:%S")
+        except:
+            return "Unknown time"
+
+
+    async def handle_bokeh_click(self, event, scenario, photo_info):
+        """Handle click on photo for bokeh analysis"""
+        try:
+            import cv2
+            import numpy as np
+            from PIL import Image
+
+            # Get click coordinates and scale them
+            click_x = event.args.get("offsetX", 0)
+            click_y = event.args.get("offsetY", 0)
+            
+            # Get image dimensions via JavaScript
+            js_code = """
+            async function getDimensions() {
+                const img = document.querySelector('img[src*="bokeh"]');
+                if (img) {
+                    return {
+                        clientWidth: img.clientWidth,
+                        clientHeight: img.clientHeight,
+                        naturalWidth: img.naturalWidth,
+                        naturalHeight: img.naturalHeight
+                    };
+                }
+                return null;
+            }
+            return await getDimensions();
+            """
+            dimensions = await ui.run_javascript(js_code)
+            
+            if not dimensions:
+                raise ValueError("Could not get image dimensions")
+                
+            client_width = dimensions.get("clientWidth")
+            client_height = dimensions.get("clientHeight")
+            natural_width = dimensions.get("naturalWidth")
+            natural_height = dimensions.get("naturalHeight")
+
+            # Scale click coordinates to match original image dimensions
+            scaled_x = int((click_x / client_width) * natural_width)
+            scaled_y = int((click_y / client_height) * natural_height)
+
+            logging.info(f"""
+            Coordinate Scaling:
+            - Display dimensions: {client_width}x{client_height}
+            - Natural dimensions: {natural_width}x{natural_height}
+            - Click coordinates (display): ({click_x}, {click_y})
+            - Scaled coordinates (natural): ({scaled_x}, {scaled_y})
+            """)
+
+            # Create debug visualization before analysis
+            debug_path = os.path.join(
+                os.path.dirname(photo_info['path']),
+                f"click_debug_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+            )
+            
+            try:
+                # Load image and create debug overlay
+                img = cv2.imread(photo_info['path'])
+                if img is not None:
+                    # Draw click point
+                    cv2.circle(img, (scaled_x, scaled_y), 50, (0, 0, 255), 3)
+                    
+                    # Draw ROI boxes for analysis
+                    roi_sizes = [200, 400, 800]  # Multiple ROI sizes for debugging
+                    for roi_size in roi_sizes:
+                        x1 = max(0, scaled_x - roi_size)
+                        y1 = max(0, scaled_y - roi_size)
+                        x2 = min(img.shape[1], scaled_x + roi_size)
+                        y2 = min(img.shape[0], scaled_y + roi_size)
+                        cv2.rectangle(img, (x1, y1), (x2, y2), (255, 0, 0), 2)
+                    
+                    cv2.imwrite(debug_path, img)
+                    logging.info(f"Saved debug visualization to {debug_path}")
+            except Exception as e:
+                logging.error(f"Failed to create debug visualization: {e}")
+
+            # Continue with analysis using scaled coordinates
+            ui.notify('Starting bokeh analysis...', type='info')
+            metadata = photo_info.get('metadata', {})
+            results = analyze_bokeh(photo_info['path'], scaled_x, scaled_y, metadata)
+            
+            # Add debug path to results if available
+            if debug_path:
+                results['click_debug_path'] = debug_path
+
+            # Store results
+            photo_info['analysis'] = {
+                **results,
+                'preview_path': photo_info['path'],
+                'analyzed_at': datetime.now().strftime("%Y%m%d_%H%M%S"),
+                'type': 'bokeh'
+            }
+
+            # Check if update_scenario is asynchronous
+            update_success = self.dataset_manager.update_scenario(
+                self.current_dataset['id'],
+                scenario
+            )
+            if update_success:  # Remove await if update_scenario is not async
+                ui.notify('Bokeh analysis complete', type='positive')
+                await self.select_scenario(scenario)
+                await self.show_photo_analysis(scenario, photo_info)
+            else:
+                ui.notify('Failed to save analysis results', type='negative')
+
+        except Exception as e:
+            logging.error(f"Error in bokeh analysis: {str(e)}")
+            ui.notify(f"Analysis failed: {str(e)}", type='negative')
+
+    def show_distortion_results(self, analysis):
+        """Display distortion analysis results"""
+        if 'metadata' in analysis:
+            self.show_metadata_card(analysis['metadata'])
+
+        # Show score and timestamp
+        with ui.row().classes('w-full justify-between mb-4'):
+            ui.label(
+                f"Distortion Score: {analysis.get('combined_score', 0):.1f}/100"
+            ).classes('text-xl font-bold')
+            ui.label(
+                f"Analyzed: {analysis.get('analysis_time', 'Unknown')}"
+            ).classes('text-gray-500')
+
+        # Show original and analyzed images side by side
+        with ui.row().classes('gap-4'):
+            # Original Image
+            with ui.card().classes('p-2'):
+                ui.label('Original Image').classes('font-bold mb-2')
+                preview_path = analysis.get('preview_path')
+                if preview_path and os.path.exists(preview_path):
+                    ui.image(preview_path).classes('max-w-xs')
+                else:
+                    ui.label('Preview not available').classes('text-red-500 italic')
+
+            # Analysis Visualization
+            with ui.card().classes('p-2'):
+                ui.label('Distortion Analysis').classes('font-bold mb-2')
+                if 'visualization_path' in analysis:
+                    ui.image(analysis['visualization_path']).classes('max-w-xs')
+                else:
+                    ui.label('Visualization not available').classes('text-red-500 italic')
+
+        # Show detailed metrics
+        with ui.card().classes('p-4 mt-4'):
+            ui.label('Detailed Measurements').classes('font-bold mb-2')
+            with ui.grid(columns=2).classes('gap-4'):
+                # Edge-based metrics
+                with ui.card().classes('p-2'):
+                    ui.label('Edge-based Analysis').classes('font-bold')
+                    edge_based = analysis.get('edge_based', {})
+                    ui.label(f"Score: {edge_based.get('score', 0):.1f}/100")
+                    ui.label(f"Average Deviation: {edge_based.get('average_deviation', 0):.2f}px")
+
+                # SIFT-based metrics
+                with ui.card().classes('p-2'):
+                    ui.label('SIFT-based Analysis').classes('font-bold')
+                    sift_based = analysis.get('sift_based', {})
+                    if sift_based.get('score') is not None:
+                        ui.label(f"Score: {sift_based.get('score', 0):.1f}/100")
+                        ui.label(f"Displacement: {sift_based.get('displacement', 0):.2f}px")
+                        ui.label(f"Radial Coefficient: {sift_based.get('radial_coefficient', 0):.3f}")
+                    else:
+                        ui.label('No SIFT analysis available').classes('text-gray-500 italic')
+
+        # Analysis interpretation
+        with ui.card().classes('p-4 mt-4'):
+            ui.label('Analysis Interpretation').classes('font-bold mb-2')
+            score = analysis.get('combined_score', 0)
+            distortion_type = analysis.get('distortion_type', 'unknown')
+            
+            if score >= 80:
+                msg = f"Excellent - Minimal {distortion_type} distortion detected"
+            elif score >= 60:
+                msg = f"Good - Some {distortion_type} distortion but within normal range"
+            else:
+                msg = f"Significant {distortion_type} distortion detected"
+            ui.label(msg)

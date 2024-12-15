@@ -292,19 +292,68 @@ class DatasetManager:
             if not dataset:
                 return False
 
+            # Create a clean copy of the scenario
+            clean_scenario = {
+                'id': str(scenario['id']),
+                'type': str(scenario['type']),
+                'created': str(scenario['created']),
+                'metadata': dict(scenario.get('metadata', {})),
+                'photos': []
+            }
+            
+            # Clean photos array
+            for photo in scenario.get('photos', []):
+                if isinstance(photo, dict):
+                    clean_photo = {
+                        'filename': str(photo.get('filename', '')),
+                        'timestamp': str(photo.get('timestamp', '')),
+                        'path': str(photo.get('path', '')),
+                        'metadata': dict(photo.get('metadata', {})),
+                        'analysis': dict(photo.get('analysis', {}))
+                    }
+                    # Remove any non-serializable objects
+                    if 'preview' in clean_photo:
+                        del clean_photo['preview']
+                    clean_scenario['photos'].append(clean_photo)
+
             # Find and update the scenario
             for i, s in enumerate(dataset['scenarios']):
                 if s['id'] == scenario['id']:
-                    dataset['scenarios'][i] = scenario
+                    dataset['scenarios'][i] = clean_scenario
                     break
 
-            # Save updated dataset info
+            # Use atomic write with backup
             info_path = os.path.join(self.base_path, dataset_id, "info.json")
-            with open(info_path, 'w') as f:
-                json.dump(dataset, f, indent=2)
+            temp_path = f"{info_path}.tmp"
+            backup_path = f"{info_path}.bak"
 
-            logging.info(f"Updated scenario in dataset {dataset_id}")
-            return True
+            try:
+                # Backup existing file
+                if os.path.exists(info_path):
+                    shutil.copy2(info_path, backup_path)
+
+                # Write to temp file
+                with open(temp_path, 'w') as f:
+                    json.dump(dataset, f, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+
+                # Atomic rename
+                os.replace(temp_path, info_path)
+
+                # Remove backup on success
+                if os.path.exists(backup_path):
+                    os.remove(backup_path)
+
+                logging.info(f"Updated scenario in dataset {dataset_id}")
+                return True
+
+            except Exception as e:
+                # Restore from backup if available
+                if os.path.exists(backup_path):
+                    os.replace(backup_path, info_path)
+                raise e
+
         except Exception as e:
             logging.error(f"Error updating scenario: {e}")
             return False

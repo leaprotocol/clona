@@ -7,6 +7,7 @@ import time
 import exifread
 import io
 import os
+import subprocess
 
 
 
@@ -35,17 +36,46 @@ class CameraManager:
             if 'Image Model' in tags:
                 results['camera_model'] = str(tags['Image Model'])
 
-            # Lens info
-            lens_tags = ['EXIF LensModel', 'MakerNote LensType']
+            # Lens info - Nikon specific tags
+            lens_tags = [
+                'EXIF LensModel',
+                'MakerNote LensType',
+                'MakerNote Lens',
+                'MakerNote LensIDNumber',
+                'MakerNote LensData'
+            ]
             for tag in lens_tags:
                 if tag in tags:
                     results['lens_name'] = str(tags[tag])
                     break
 
-            # Focal length
+            # Aperture - try multiple tags
+            aperture_tags = ['EXIF FNumber', 'EXIF ApertureValue', 'MakerNote FNumber']
+            for tag in aperture_tags:
+                if tag in tags:
+                    try:
+                        nums = str(tags[tag]).split('/')
+                        if len(nums) == 2:
+                            results['aperture'] = f"f/{float(nums[0]) / float(nums[1]):.1f}"
+                        else:
+                            results['aperture'] = f"f/{float(nums[0]):.1f}"
+                        break
+                    except (ValueError, IndexError):
+                        continue
 
+            # Focal length
             if 'EXIF FocalLength' in tags:
-                results['focal_length'] = str(tags['EXIF FocalLength'])
+                focal_str = str(tags['EXIF FocalLength'])
+                try:
+                    # Handle fraction format (e.g., "50/1")
+                    if '/' in focal_str:
+                        nums = focal_str.split('/')
+                        focal_length = float(nums[0]) / float(nums[1])
+                    else:
+                        focal_length = float(focal_str)
+                    results['focal_length'] = str(int(focal_length))  # Convert to integer string
+                except (ValueError, IndexError):
+                    logging.error(f"Could not parse focal length: {focal_str}")
 
             # Focus distance
             focus_tags = ['MakerNote FocusDistance', 'EXIF SubjectDistance', 'EXIF FocusDistanceLower', 'EXIF FocusDistanceLower']
@@ -72,14 +102,6 @@ class CameraManager:
                     results['shutterspeed'] = shutter  # Already in format like "1/60"
                 else:
                     results['shutterspeed'] = str(float(shutter))  # Convert to string
-
-            # Aperture
-            if 'EXIF FNumber' in tags:
-                nums = str(tags['EXIF FNumber']).split('/')
-                if len(nums) == 2:
-                    results['aperture'] = float(nums[0]) / float(nums[1])
-                else:
-                    results['aperture'] = float(nums[0])
 
             return results
 
@@ -345,7 +367,7 @@ class CameraManager:
             return None
 
     def initialize_camera(self):
-        """Initialize the camera and set up configuration"""
+        """Initialize the camera with filesystem lock detection"""
         try:
             # First check if any cameras are detected
             cameras = self.list_connected_cameras()
@@ -358,30 +380,31 @@ class CameraManager:
             # Initialize the camera
             self.camera = gp.Camera()
             
-            # Initialize the camera with the correct port
+            # Initialize with port if available
             if 'port' in cameras[0]:
                 port_info_list = gp.PortInfoList()
                 port_info_list.load()
                 idx = port_info_list.lookup_path(cameras[0]['port'])
                 port_info = port_info_list[idx]
                 self.camera.set_port_info(port_info)
-            else:
-                logging.error("No port information available for the detected camera")
-                return False
-
-            # Check if camera is ready
-            self.connected = self.wait_for_camera_ready()
+            
+            # Try to initialize with shorter timeout first
+            self.connected = self.wait_for_camera_ready(timeout=5)
+            
+            if not self.connected:
+                # If failed, try to unmount camera from filesystem
+                try:
+                    # subprocess.run(['gvfs-mount', '-s', 'gphoto2'], 
+                    #              stderr=subprocess.DEVNULL)
+                    time.sleep(2)  # Wait for unmount
+                    self.connected = self.wait_for_camera_ready(timeout=5)
+                except Exception as e:
+                    logging.warning(f"Failed to unmount camera: {e}")
+            
             if not self.connected:
                 logging.error("Failed to initialize camera: Camera not ready")
                 return False
             
-            # Get and log camera information
-            try:
-                summary = self.camera.get_summary()
-                logging.info(f"Camera initialized: {summary}")
-            except Exception as e:
-                logging.warning(f"Could not get camera summary: {e}")
-
             logging.info("Camera initialized and ready")
             return True
             
@@ -559,3 +582,59 @@ class CameraManager:
             logging.error(f"Error retrieving camera settings: {e}")
 
         return camera_settings
+
+    def set_aperture(self, aperture_value):
+        """Set camera aperture to specified value"""
+        try:
+            config = self.camera.get_config()
+            
+            # Additional Nikon-specific setting names
+            aperture_settings = [
+                'aperture',
+                'f-number',
+                'fnumber',
+                'aperturevalue',
+                'd002',              # Nikon PTP code
+                'capturesettings/f-number',
+                'capturesettings/aperture',
+                '5007',             # Another Nikon PTP code
+                'exposureprogram'   # Some Nikons require this first
+            ]
+            
+            # First try to set exposure program to aperture priority
+            try:
+                OK, expprogram = gp.gp_widget_get_child_by_name(config, 'expprogram')
+                if OK >= gp.GP_OK:
+                    expprogram.set_value('A')
+                    self.camera.set_config(config)
+                    logging.debug("Set camera to Aperture Priority mode")
+                    # Get fresh config after mode change
+                    config = self.camera.get_config()
+            except Exception as e:
+                logging.debug(f"Could not set exposure program: {e}")
+
+            # Try each possible setting name
+            for setting_name in aperture_settings:
+                try:
+                    OK, widget = gp.gp_widget_get_child_by_name(config, setting_name)
+                    if OK >= gp.GP_OK:
+                        # For Nikon, we might need to format the aperture value
+                        formatted_value = f"f/{aperture_value}"
+                        try:
+                            widget.set_value(formatted_value)
+                        except:
+                            # If formatted value fails, try numeric
+                            widget.set_value(str(aperture_value))
+                        
+                        self.camera.set_config(config)
+                        logging.debug(f"Aperture set to {aperture_value}")
+                        return True
+                except Exception as e:
+                    logging.debug(f"Could not set {setting_name}: {e}")
+                    continue
+                
+            raise ValueError(f"Could not set aperture to {aperture_value}")
+            
+        except Exception as e:
+            logging.error(f"Error setting aperture: {e}")
+            return False

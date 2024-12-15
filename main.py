@@ -6,7 +6,7 @@ from dataset_manager import DatasetManager
 def main():
     # Configure logging
     logging.basicConfig(
-        level=logging.INFO,
+        level=logging.DEBUG,
         format='%(asctime)s [%(levelname)s] %(message)s'
     )
     

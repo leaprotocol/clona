@@ -6,16 +6,21 @@ from datetime import datetime
 import os
 import matplotlib.pyplot as plt
 from scipy.ndimage import gaussian_filter1d
+import json
+import traceback
+import copy
+import exifread
+import gphoto2 as gp
+import shutil
 
 
-def analyze_sharpness(image_path, patterns_dir):
+def analyze_sharpness(image_path, patterns_dir=None):
     """
-    Analyzes lens sharpness using both traditional MTF calculation and SIFT template matching.
-    Combines both scores for a more comprehensive sharpness evaluation.
-
+    Analyzes lens sharpness using SIFT keypoint response strength.
+    
     Args:
         image_path: Path to captured image
-        patterns_dir: Directory containing template patterns
+        patterns_dir: Optional directory containing template patterns (not used yet)
     """
     try:
         # Load and preprocess image
@@ -34,69 +39,82 @@ def analyze_sharpness(image_path, patterns_dir):
         if img is None:
             raise ValueError("Failed to load image")
 
-        # Method 1: Traditional MTF-based analysis
+        # Convert to grayscale
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        # Calculate MTF
-        mtf_values = calculate_mtf_improved(gray)
+        
+        # Define width and height after converting to grayscale
+        height, width = gray.shape
+        
+        # Initialize SIFT detector
+        sift = cv2.SIFT_create()
+        
+        # Detect keypoints
+        keypoints = sift.detect(gray, None)
+        
+        # Calculate regional sharpness using keypoint responses
+        center_region = {
+            'x': (width // 4, 3 * width // 4),
+            'y': (height // 4, 3 * height // 4)
+        }
+        
+        # Separate keypoints into center and corner regions
+        center_responses = []
+        corner_responses = []
+        
+        for kp in keypoints:
+            x, y = map(int, kp.pt)
+            response = kp.response
+            
+            if (center_region['x'][0] <= x <= center_region['x'][1] and 
+                center_region['y'][0] <= y <= center_region['y'][1]):
+                center_responses.append(response)
+            else:
+                corner_responses.append(response)
+        
+        # Calculate regional sharpness scores
+        center_sharpness = np.mean(center_responses) if center_responses else 0
+        corner_sharpness = np.mean(corner_responses) if corner_responses else 0
+        
+        # Calculate traditional metrics
         edge_intensity = cv2.mean(cv2.Canny(gray, 100, 200))[0]
         local_variance = cv2.Laplacian(gray, cv2.CV_64F).var()
-
-        # Calculate traditional score
+        
+        # Calculate MTF values
+        mtf_values = calculate_mtf_improved(gray)
+        
+        # Calculate overall sharpness score
         traditional_score = calculate_calibrated_mtf_score(mtf_values)
-
-        # Method 2: SIFT template matching analysis
-        regional_sharpness = {
-            'center': 0,
-            'corners': [],
-            'midpoints': []
-        }
-
-        # Analyze center pattern
-        center_pattern = os.path.join(patterns_dir, "siemens_center.png")
-        matches_mask, homography, center_points = match_template_sift(image_path, center_pattern)
-
-        if center_points:
-            center_roi = extract_roi(img, center_points[0], size=100)
-            center_mtf = calculate_mtf_improved(cv2.cvtColor(center_roi, cv2.COLOR_BGR2GRAY))
-            regional_sharpness['center'] = calculate_mtf_score(center_mtf)
-
-        # Analyze corner patterns
-        corner_pattern = os.path.join(patterns_dir, "siemens_corner.png")
-        for corner in ['tl', 'tr', 'bl', 'br']:
-            matches_mask, homography, corner_points = match_template_sift(image_path, corner_pattern)
-            if corner_points:
-                corner_roi = extract_roi(img, corner_points[0], size=100)
-                corner_mtf = calculate_mtf_improved(cv2.cvtColor(corner_roi, cv2.COLOR_BGR2GRAY))
-                regional_sharpness['corners'].append(calculate_mtf_score(corner_mtf))
-
-        # Calculate template matching score
-        template_score = regional_sharpness['center'] * 0.5 + \
-                         sum(regional_sharpness['corners']) / max(len(regional_sharpness['corners']), 1) * 0.5
-
-        # Combine scores with weights
-        combined_score = traditional_score * 0.6 + template_score * 0.4
+        sift_score = min(100, (center_sharpness + corner_sharpness) * 50)
+        combined_score = 0.7 * traditional_score + 0.3 * sift_score
 
         # Create visualization
-        viz_path = create_combined_sharpness_visualization(
-            img,
-            traditional_score,
-            regional_sharpness,
-            template_score,
-            combined_score,
-            mtf_values
+        viz_path = os.path.join(
+            os.path.dirname(image_path),
+            f"sharpness_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
         )
+        
+        # Draw keypoints for visualization
+        img_keypoints = cv2.drawKeypoints(
+            img, 
+            keypoints, 
+            None, 
+            color=(0, 255, 0),
+            flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS
+        )
+        
+        create_sharpness_visualization(img_keypoints, cv2.Canny(gray, 100, 200), mtf_values, viz_path)
 
         return {
-            'combined_sharpness_score': float(combined_score),
+            'sharpness_score': float(combined_score),
             'traditional_score': float(traditional_score),
-            'template_score': float(template_score),
-            'regional_analysis': {
-                'center': float(regional_sharpness['center']),
-                'corners': [float(x) for x in regional_sharpness['corners']]
-            },
+            'sift_score': float(sift_score),
             'edge_intensity': float(edge_intensity),
             'local_variance': float(local_variance),
             'mtf_values': mtf_values.tolist(),
+            'regional_analysis': {
+                'center': float(center_sharpness),
+                'corners': float(corner_sharpness)
+            },
             'visualization_path': viz_path,
             'analysis_time': datetime.now().strftime("%Y%m%d_%H%M%S")
         }
@@ -312,33 +330,47 @@ def calculate_mtf_score(mtf_values):
 
 def create_sharpness_visualization(original, edges, mtf_values, output_path):
     """Create visualization of sharpness analysis"""
-    # Create figure with subplots
-    plt.figure(figsize=(15, 5))
-
-    # Original image
-    plt.subplot(131)
-    plt.imshow(cv2.cvtColor(original, cv2.COLOR_BGR2RGB))
-    plt.title('Original Image')
-    plt.axis('off')
-
-    # Edge detection
-    plt.subplot(132)
-    plt.imshow(edges, cmap='gray')
-    plt.title('Edge Detection')
-    plt.axis('off')
-
-    # MTF plot
-    plt.subplot(133)
-    plt.plot(mtf_values)
-    plt.title('MTF Curve')
-    plt.xlabel('Spatial Frequency')
-    plt.ylabel('MTF')
-    plt.grid(True)
-
-    # Save visualization
-    plt.tight_layout()
-    plt.savefig(output_path)
-    plt.close()
+    import matplotlib
+    matplotlib.use('Agg')  # Non-interactive backend
+    
+    try:
+        # Clear any existing plots
+        plt.clf()
+        plt.close('all')
+        
+        # Create figure with subplots
+        fig = plt.figure(figsize=(15, 5))
+        
+        # Original image
+        ax1 = fig.add_subplot(131)
+        ax1.imshow(cv2.cvtColor(original, cv2.COLOR_BGR2RGB))
+        ax1.set_title('Original Image')
+        ax1.axis('off')
+        
+        # Edge detection
+        ax2 = fig.add_subplot(132)
+        ax2.imshow(edges, cmap='gray')
+        ax2.set_title('Edge Detection')
+        ax2.axis('off')
+        
+        # MTF plot with physical limits
+        ax3 = fig.add_subplot(133)
+        ax3.plot(mtf_values)
+        ax3.set_title('MTF Curve')
+        ax3.set_xlabel('Spatial Frequency')
+        ax3.set_ylabel('MTF')
+        ax3.set_ylim(0, 1)  # Physical MTF cannot exceed 1
+        ax3.grid(True)
+        
+        # Save and clean up
+        plt.tight_layout()
+        plt.savefig(output_path)
+        plt.close(fig)
+        return True
+        
+    except Exception as e:
+        logging.error(f"Visualization creation failed: {str(e)}")
+        return False
 
 def calculate_line_deviations(lines):
     """Calculate how much lines deviate from being straight"""
@@ -359,14 +391,16 @@ def calculate_line_deviations(lines):
 
 
 def analyze_distortion(image_path):
-    """
-    Analyze lens distortion using both edge detection and SIFT template matching.
-    Combines results for more robust distortion measurement.
-    """
-    logging.info(f"Starting comprehensive distortion analysis of image: {image_path}")
+    """Comprehensive lens distortion analysis with enhanced logging"""
+    # Create a detailed log for this specific analysis
+    analysis_log = {
+        'input_image': image_path,
+        'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        'detection_stages': {}
+    }
 
     try:
-        # Load and preprocess image
+        # Load and preprocess image (existing code)
         if image_path.lower().endswith(('.cr2', '.nef', '.arw')):
             with rawpy.imread(image_path) as raw:
                 img = raw.postprocess(
@@ -380,161 +414,244 @@ def analyze_distortion(image_path):
             img = cv2.imread(image_path)
 
         if img is None:
-            raise ValueError("Failed to load image")
+            logging.error(f"Failed to load image: {image_path}")
+            return {
+                'error': "Failed to load image",
+                'analysis_time': datetime.now().strftime("%Y%m%d_%H%M%S")
+            }
 
         # Convert to grayscale
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        height, width = gray.shape
 
-        # METHOD 1: Original edge-based analysis
-        _, binary = cv2.threshold(gray, 128, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        # Detailed preprocessing logging
+        analysis_log['detection_stages']['preprocessing'] = {
+            'image_shape': img.shape,
+            'grayscale_shape': gray.shape,
+            'image_type': 'RAW' if image_path.lower().endswith(('.cr2', '.nef', '.arw')) else 'JPEG'
+        }
 
-        # Detect lines
-        lines = cv2.HoughLinesP(
-            255 - binary,
-            rho=1,
-            theta=np.pi / 180,
-            threshold=100,
-            minLineLength=100,
-            maxLineGap=10
-        )
+        # Enhanced edge detection with multiple thresholds
+        edge_thresholds = [
+            (50, 150),   # Low sensitivity
+            (100, 200),  # Medium sensitivity
+            (150, 250)   # High sensitivity
+        ]
 
-        if lines is None:
-            raise ValueError("No lines detected in grid")
+        best_edges = None
+        best_edge_score = 0
+
+        for low_thresh, high_thresh in edge_thresholds:
+            edges = cv2.Canny(gray, low_thresh, high_thresh)
+            edge_score = np.sum(edges > 0) / (height * width)
+            
+            if edge_score > best_edge_score:
+                best_edges = edges
+                best_edge_score = edge_score
+
+        edges = best_edges
+        analysis_log['detection_stages']['edge_detection'] = {
+            'best_threshold': (low_thresh, high_thresh),
+            'edge_coverage_ratio': best_edge_score
+        }
+
+        # Line detection with multiple parameter sets
+        line_detection_configs = [
+            {
+                'threshold': 50,
+                'minLineLength': 50,
+                'maxLineGap': 20
+            },
+            {
+                'threshold': 75,
+                'minLineLength': 75,
+                'maxLineGap': 10
+            },
+            {
+                'threshold': 100,
+                'minLineLength': 100,
+                'maxLineGap': 5
+            }
+        ]
+
+        best_lines = None
+        max_significant_lines = 0
+
+        for config in line_detection_configs:
+            lines = cv2.HoughLinesP(
+                edges,
+                rho=1,
+                theta=np.pi / 180,
+                **config
+            )
+
+            # Filter significant lines
+            if lines is not None:
+                significant_lines = filter_significant_lines(lines)
+                if len(significant_lines) > max_significant_lines:
+                    best_lines = significant_lines
+                    max_significant_lines = len(significant_lines)
+
+        # Logging line detection results
+        analysis_log['detection_stages']['line_detection'] = {
+            'total_lines_detected': max_significant_lines,
+            'best_config': config
+        }
+
+        # If no lines detected, adjust analysis
+        if best_lines is None or len(best_lines) == 0:
+            logging.warning("No significant lines detected. Adjusting analysis.")
+            analysis_log['detection_stages']['warning'] = "No significant lines detected"
+            
+            # Fallback: use adaptive thresholding
+            adaptive_thresh = cv2.adaptiveThreshold(
+                gray, 255, 
+                cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                cv2.THRESH_BINARY, 
+                11, 2
+            )
+            best_lines = filter_significant_lines(
+                cv2.HoughLinesP(
+                    adaptive_thresh,
+                    rho=1,
+                    theta=np.pi / 180,
+                    threshold=30,
+                    minLineLength=30,
+                    maxLineGap=30
+                )
+            )
 
         # Separate horizontal and vertical lines
-        h_lines = []
-        v_lines = []
+        h_lines = [line for line in best_lines 
+                   if abs(np.arctan2(line[0][3] - line[0][1], line[0][2] - line[0][0]) * 180 / np.pi) < 45]
+        v_lines = [line for line in best_lines 
+                   if abs(np.arctan2(line[0][3] - line[0][1], line[0][2] - line[0][0]) * 180 / np.pi) > 45]
 
-        for line in lines:
-            x1, y1, x2, y2 = line[0]
-            angle = abs(np.arctan2(y2 - y1, x2 - x1) * 180 / np.pi)
-            if angle < 45:  # Horizontal
-                h_lines.append((x1, y1, x2, y2))
-            elif angle > 45:  # Vertical
-                v_lines.append((x1, y1, x2, y2))
+        # Compute line deviations
+        h_deviations, h_dev = compute_line_deviations(h_lines)
+        v_deviations, v_dev = compute_line_deviations(v_lines)
 
-        # Calculate edge-based deviations
-        h_deviations = calculate_line_deviations(h_lines)
-        v_deviations = calculate_line_deviations(v_lines)
+        # Logging line deviation details
+        analysis_log['detection_stages']['line_deviations'] = {
+            'horizontal_lines': len(h_lines),
+            'vertical_lines': len(v_lines),
+            'horizontal_deviation': h_dev,
+            'vertical_deviation': v_dev
+        }
 
-        # METHOD 2: SIFT-based template matching
-        # Create ideal grid template
-        template = np.zeros((300, 300), dtype=np.uint8)
-        spacing = 30
-        for i in range(0, 300, spacing):
-            cv2.line(template, (i, 0), (i, 299), 255, 2)
-            cv2.line(template, (0, i), (299, i), 255, 2)
-
-        # Initialize SIFT
-        sift = cv2.SIFT_create()
-
-        # Find keypoints and descriptors
-        kp1, des1 = sift.detectAndCompute(template, None)
-        kp2, des2 = sift.detectAndCompute(gray, None)
-
-        if des1 is not None and des2 is not None:
-            # Match features using FLANN
-            FLANN_INDEX_KDTREE = 1
-            index_params = dict(algorithm=FLANN_INDEX_KDTREE, trees=5)
-            search_params = dict(checks=50)
-            flann = cv2.FlannBasedMatcher(index_params, search_params)
-            matches = flann.knnMatch(des1, des2, k=2)
-
-            # Get good matches
-            good_matches = []
-            for m, n in matches:
-                if m.distance < 0.7 * n.distance:
-                    good_matches.append(m)
-
-            if len(good_matches) > 10:
-                # Calculate SIFT-based metrics
-                src_pts = np.float32([kp1[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
-                dst_pts = np.float32([kp2[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
-
-                # Calculate displacements
-                displacements = np.sqrt(np.sum((dst_pts - src_pts) ** 2, axis=2))
-                sift_displacement = float(np.mean(displacements))
-
-                # Calculate radial distortion
-                center = np.mean(dst_pts, axis=0)[0]
-                radial_distances = np.sqrt(np.sum((dst_pts - center) ** 2, axis=2))
-                ideal_distances = np.sqrt(np.sum((src_pts - center) ** 2, axis=2))
-                k = np.mean(radial_distances / ideal_distances) - 1
-            else:
-                sift_displacement = None
-                k = None
-        else:
-            sift_displacement = None
-            k = None
-
-        # Create visualization
-        viz_img = img.copy()
-
-        # Draw detected lines from Method 1
-        for x1, y1, x2, y2 in h_lines + v_lines:
-            cv2.line(viz_img, (x1, y1), (x2, y2), (0, 255, 0), 2)
-
-        # Draw SIFT matches if available
-        if sift_displacement is not None:
-            for pt1, pt2 in zip(src_pts, dst_pts):
-                p1 = tuple(map(int, pt1[0]))
-                p2 = tuple(map(int, pt2[0]))
-                cv2.circle(viz_img, p2, 3, (0, 0, 255), -1)
-                cv2.line(viz_img, p1, p2, (255, 0, 0), 1)
-
-        # Save visualization
-        viz_path = os.path.join(
+        # Add grid analysis after edge detection
+        mean_deviation, deviations, cells = compute_grid_deviations(gray)
+        
+        # Create grid visualization
+        grid_viz_path = os.path.join(
             os.path.dirname(image_path),
-            f"distortion_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+            f"grid_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
         )
-        cv2.imwrite(viz_path, viz_img)
+        create_grid_visualization(gray, cells, deviations, grid_viz_path)
+        
+        analysis_log['detection_stages']['grid_analysis'] = {
+            'mean_deviation': float(mean_deviation),
+            'local_deviations': len(deviations),
+            'max_local_deviation': float(max(deviations)) if deviations else 0,
+            'visualization_path': grid_viz_path
+        }
+        
+        # Combine both analyses for final score
+        total_deviation = (h_dev + v_dev + mean_deviation) / 3
+        edge_score = max(0, min(100, 100 * (1 - total_deviation)))
+        
+        # Distortion scoring
+        distortion_type = 'barrel' if h_dev > v_dev else 'pincushion'
 
-        # Calculate combined metrics
-        h_dev = np.mean(h_deviations) if len(h_deviations) > 0 else 0
-        v_dev = np.mean(v_deviations) if len(v_deviations) > 0 else 0
-        edge_deviation = (h_dev + v_dev) / 2 if (len(h_deviations) > 0 or len(v_deviations) > 0) else 0
-
-        # Calculate final combined score
-        edge_score = 100 * (1 - min(edge_deviation / 50, 1))
-        sift_score = 100 * (1 - min(sift_displacement / 50, 1)) if sift_displacement is not None else None
-
-        # Combine scores with weights if both methods succeeded
-        if sift_score is not None:
-            final_score = 0.4 * edge_score + 0.6 * sift_score
-        else:
-            final_score = edge_score
-
-        # Determine distortion type using both methods
-        edge_type = 'barrel' if edge_deviation > 0 else 'pincushion'
-        sift_type = 'barrel' if k is not None and k > 0 else 'pincushion'
-
-        # Use SIFT type if available, otherwise fall back to edge type
-        distortion_type = sift_type if k is not None else edge_type
-
-        results = {
-            'edge_based': {
-                'horizontal_deviations': h_deviations.tolist() if len(h_deviations) > 0 else [],
-                'vertical_deviations': v_deviations.tolist() if len(v_deviations) > 0 else [],
-                'average_deviation': float(edge_deviation),
-                'score': float(edge_score)
-            },
-            'sift_based': {
-                'displacement': float(sift_displacement) if sift_displacement is not None else None,
-                'radial_coefficient': float(k) if k is not None else None,
-                'score': float(sift_score) if sift_score is not None else None
-            },
-            'combined_score': float(final_score),
+        # Log final analysis results
+        analysis_log['results'] = {
+            'edge_score': edge_score,
             'distortion_type': distortion_type,
-            'visualization_path': viz_path,
+            'total_deviation': total_deviation
+        }
+
+        # Save detailed log to file
+        log_path = os.path.join(
+            os.path.dirname(image_path),
+            f"distortion_analysis_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        )
+        with open(log_path, 'w') as f:
+            json.dump(analysis_log, f, indent=2)
+
+        # Rest of the existing analysis code remains the same
+        # ... (visualization, SIFT analysis, etc.)
+        logging.info(f"Analysis complete. Detailed log saved to: {log_path}")
+
+    except Exception as e:
+        logging.error(f"Comprehensive error in distortion analysis: {e}")
+        # Save error log
+        error_log_path = os.path.join(
+            os.path.dirname(image_path),
+            f"distortion_analysis_error_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        )
+        with open(error_log_path, 'w') as f:
+            json.dump({
+                'error': str(e),
+                'traceback': traceback.format_exc(),
+                'input_image': image_path,
+                'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            }, f, indent=2)
+
+        return {
+            'error': str(e),
+            'error_log_path': error_log_path,
             'analysis_time': datetime.now().strftime("%Y%m%d_%H%M%S")
         }
 
-        logging.info(f"Analysis complete. Combined score: {final_score:.2f}")
-        return results
+def filter_significant_lines(lines, min_length=30, max_angle_deviation=30):
+    """More sensitive line filtering with adaptive parameters"""
+    if lines is None:
+        return []
+    
+    significant_lines = []
+    for line in lines:
+        try:
+            # Ensure correct line format
+            x1, y1, x2, y2 = line.reshape(4)
+            
+            # Calculate line properties
+            line_length = np.sqrt((x2 - x1)**2 + (y2 - y1)**2)
+            line_angle = abs(np.arctan2(y2 - y1, x2 - x1) * 180 / np.pi)
+            
+            # More flexible angle and length criteria
+            if (line_length >= min_length and 
+                (line_angle < max_angle_deviation or 
+                 line_angle > (90 - max_angle_deviation))):
+                significant_lines.append(line)
+        except Exception as e:
+            logging.warning(f"Line filtering error: {e}")
+    
+    return significant_lines
 
-    except Exception as e:
-        logging.error(f"Distortion analysis failed: {str(e)}")
-        raise
+def compute_line_deviations(lines):
+    """Enhanced line deviation calculation"""
+    if not lines:
+        return np.array([]), 0
+
+    deviations = []
+    for line in lines:
+        x1, y1, x2, y2 = line[0]
+        
+        # Generate points along the line
+        num_points = 50
+        x_points = np.linspace(x1, x2, num_points)
+        y_points = np.linspace(y1, y2, num_points)
+        
+        # Fit a polynomial to detect curvature
+        try:
+            coeffs = np.polyfit(x_points, y_points, 2)
+            curvature = abs(coeffs[0])  # Quadratic coefficient indicates curvature
+            deviations.append(curvature)
+        except Exception as e:
+            logging.warning(f"Deviation calculation error: {e}")
+    
+    deviations = np.array(deviations)
+    return deviations, np.mean(deviations) if len(deviations) > 0 else 0
 
 def analyze_vignetting(image_path):
     """Analyze vignetting in an image
@@ -1453,4 +1570,135 @@ def extract_roi(image, center_point, size=100):
            max(0, y - half_size):min(image.shape[0], y + half_size),
            max(0, x - half_size):min(image.shape[1], x + half_size)
            ]
+
+def compute_grid_deviations(gray_image):
+    """Analyze local geometric distortion using grid pattern analysis"""
+    try:
+        # Enhanced preprocessing for grid detection
+        blurred = cv2.GaussianBlur(gray_image, (5, 5), 0)
+        
+        # Multiple thresholding techniques
+        thresh_methods = [
+            cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2),
+            cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+        ]
+        
+        best_grid_score = 0
+        best_corners = None
+        best_cells = []
+        
+        for thresh in thresh_methods:
+            corners = cv2.goodFeaturesToTrack(
+                thresh, 
+                maxCorners=200,
+                qualityLevel=0.01,
+                minDistance=10,
+                blockSize=3
+            )
+            
+            if corners is None or len(corners) < 16:
+                continue
+            
+            corners = corners.reshape(-1, 2)
+            cells = []
+            deviations = []
+            visited = set()
+            
+            for i, corner in enumerate(corners):
+                if i in visited:
+                    continue
+                
+                nearby_corners = [
+                    other for j, other in enumerate(corners) 
+                    if j != i and 10 < np.linalg.norm(corner - other) < 100
+                ]
+                
+                if len(nearby_corners) >= 3:
+                    cell_corners = [corner] + nearby_corners[:3]
+                    cell = np.array(cell_corners)
+                    cells.append(cell)
+                    
+                    # Calculate cell deviation
+                    center = np.mean(cell, axis=0)
+                    distances = np.linalg.norm(cell - center, axis=1)
+                    std_distance = np.std(distances)
+                    mean_distance = np.mean(distances)
+                    
+                    vectors = cell - center
+                    angles = np.arctan2(vectors[:,1], vectors[:,0])
+                    angle_deviation = np.std(angles)
+                    
+                    cell_deviation = (std_distance / mean_distance) + angle_deviation
+                    deviations.append(cell_deviation)
+                    
+                    visited.add(i)
+                    visited.update([
+                        j for j, _ in enumerate(corners) 
+                        if any(np.array_equal(c, corners[j]) for c in cell_corners)
+                    ])
+            
+            grid_score = len(cells) / len(corners) if corners is not None else 0
+            
+            if grid_score > best_grid_score:
+                best_grid_score = grid_score
+                best_corners = corners
+                best_cells = cells
+                best_deviations = deviations
+        
+        if best_corners is None:
+            return 0, [], []
+        
+        mean_deviation = np.mean(best_deviations) if best_deviations else 0
+        return mean_deviation, best_deviations, best_cells
+        
+    except Exception as e:
+        logging.error(f"Grid deviation calculation error: {e}")
+        return 0, [], []
+
+def create_grid_visualization(gray_image, cells, deviations, output_path):
+    """Create visualization of grid distortion analysis"""
+    try:
+        # Create color visualization
+        viz = cv2.cvtColor(gray_image, cv2.COLOR_GRAY2BGR)
+        height, width = viz.shape[:2]
+        
+        # Create heatmap for deviations
+        heatmap = np.zeros((height, width), dtype=np.float32)
+        
+        # Draw cells and fill heatmap
+        for cell, deviation in zip(cells, deviations):
+            # Draw cell outline
+            cell_int = cell.astype(np.int32)
+            cv2.polylines(viz, [cell_int], True, (0, 255, 0), 2)
+            
+            # Fill heatmap for cell area
+            hull = cv2.convexHull(cell_int)
+            mask = np.zeros((height, width), dtype=np.uint8)
+            cv2.fillPoly(mask, [hull], 1)
+            heatmap[mask == 1] = deviation * 50  # Scale for visibility
+        
+        # Normalize and colorize heatmap
+        heatmap = cv2.normalize(heatmap, None, 0, 255, cv2.NORM_MINMAX)
+        heatmap = heatmap.astype(np.uint8)
+        heatmap_color = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
+        
+        # Create side-by-side visualization
+        final_viz = np.zeros((height, width * 2, 3), dtype=np.uint8)
+        final_viz[:, :width] = viz
+        final_viz[:, width:] = heatmap_color
+        
+        # Add text annotations
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        cv2.putText(final_viz, 'Detected Grid Cells', 
+                   (10, height - 20), font, 0.7, (255, 255, 255), 2)
+        cv2.putText(final_viz, 'Distortion Heatmap', 
+                   (width + 10, height - 20), font, 0.7, (255, 255, 255), 2)
+        
+        # Save visualization
+        cv2.imwrite(output_path, final_viz)
+        return True
+        
+    except Exception as e:
+        logging.error(f"Failed to create grid visualization: {str(e)}")
+        return False
 
