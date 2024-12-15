@@ -8,9 +8,15 @@ import matplotlib.pyplot as plt
 from scipy.ndimage import gaussian_filter1d
 
 
+def analyze_sharpness(image_path, patterns_dir):
+    """
+    Analyzes lens sharpness using both traditional MTF calculation and SIFT template matching.
+    Combines both scores for a more comprehensive sharpness evaluation.
 
-def analyze_sharpness(image_path):
-    """Analyze image sharpness using edge detection and MTF calculations"""
+    Args:
+        image_path: Path to captured image
+        patterns_dir: Directory containing template patterns
+    """
     try:
         # Load and preprocess image
         if image_path.lower().endswith(('.cr2', '.nef', '.arw')):
@@ -24,71 +30,136 @@ def analyze_sharpness(image_path):
                 img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
         else:
             img = cv2.imread(image_path)
-            
+
         if img is None:
             raise ValueError("Failed to load image")
 
-        # Convert to grayscale
+        # Method 1: Traditional MTF-based analysis
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        
-        # Apply Gaussian blur to reduce noise before edge detection
-        blurred = cv2.GaussianBlur(gray, (3, 3), 0)
-        
-        # Enhanced edge detection with better thresholds and aperture size
-        edges = cv2.Canny(blurred, 100, 200, apertureSize=3)
-        
-        # Calculate local variance as measure of detail retention
-        kernel_size = 5
-        local_var = cv2.Laplacian(blurred, cv2.CV_64F).var()
-        
-        # Calculate local contrast using Sobel operators
-        sobelx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
-        sobely = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
-        gradient_magnitude = np.sqrt(sobelx**2 + sobely**2)
-
-        # Calculate contrast metrics
-        local_contrast = np.mean(gradient_magnitude)
-        edge_intensity = np.mean(edges[edges > 0]) if np.any(edges > 0) else 0
-        edge_density = np.count_nonzero(edges) / edges.size
-
-        # Calculate MTF with improved frequency analysis
+        # Calculate MTF
         mtf_values = calculate_mtf_improved(gray)
-        
-        # Calculate scores with realistic scaling
-        contrast_score = min(100, (local_contrast / 50) * 100)  # Adjusted scaling
-        edge_score = min(100, (edge_intensity / 128) * 100)
-        mtf_score = calculate_calibrated_mtf_score(mtf_values)
+        edge_intensity = cv2.mean(cv2.Canny(gray, 100, 200))[0]
+        local_variance = cv2.Laplacian(gray, cv2.CV_64F).var()
 
-        # Calculate overall score with physical weighting
-        overall_score = (
-            contrast_score * 0.4 +
-            edge_score * 0.3 +
-            mtf_score * 0.3
-        )
+        # Calculate traditional score
+        traditional_score = calculate_calibrated_mtf_score(mtf_values)
 
-        # Apply physical limits
-        overall_score = min(95, overall_score)  # No lens is perfect
-        
+        # Method 2: SIFT template matching analysis
+        regional_sharpness = {
+            'center': 0,
+            'corners': [],
+            'midpoints': []
+        }
+
+        # Analyze center pattern
+        center_pattern = os.path.join(patterns_dir, "siemens_center.png")
+        matches_mask, homography, center_points = match_template_sift(image_path, center_pattern)
+
+        if center_points:
+            center_roi = extract_roi(img, center_points[0], size=100)
+            center_mtf = calculate_mtf_improved(cv2.cvtColor(center_roi, cv2.COLOR_BGR2GRAY))
+            regional_sharpness['center'] = calculate_mtf_score(center_mtf)
+
+        # Analyze corner patterns
+        corner_pattern = os.path.join(patterns_dir, "siemens_corner.png")
+        for corner in ['tl', 'tr', 'bl', 'br']:
+            matches_mask, homography, corner_points = match_template_sift(image_path, corner_pattern)
+            if corner_points:
+                corner_roi = extract_roi(img, corner_points[0], size=100)
+                corner_mtf = calculate_mtf_improved(cv2.cvtColor(corner_roi, cv2.COLOR_BGR2GRAY))
+                regional_sharpness['corners'].append(calculate_mtf_score(corner_mtf))
+
+        # Calculate template matching score
+        template_score = regional_sharpness['center'] * 0.5 + \
+                         sum(regional_sharpness['corners']) / max(len(regional_sharpness['corners']), 1) * 0.5
+
+        # Combine scores with weights
+        combined_score = traditional_score * 0.6 + template_score * 0.4
+
         # Create visualization
-        viz_path = os.path.join(
-            os.path.dirname(image_path),
-            f"sharpness_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+        viz_path = create_combined_sharpness_visualization(
+            img,
+            traditional_score,
+            regional_sharpness,
+            template_score,
+            combined_score,
+            mtf_values
         )
-        create_calibrated_visualization(img, edges, mtf_values, viz_path)
 
         return {
-            'sharpness_score': float(overall_score),
+            'combined_sharpness_score': float(combined_score),
+            'traditional_score': float(traditional_score),
+            'template_score': float(template_score),
+            'regional_analysis': {
+                'center': float(regional_sharpness['center']),
+                'corners': [float(x) for x in regional_sharpness['corners']]
+            },
             'edge_intensity': float(edge_intensity),
-            'edge_density': float(edge_density),
-            'local_variance': float(local_var),
+            'local_variance': float(local_variance),
             'mtf_values': mtf_values.tolist(),
             'visualization_path': viz_path,
             'analysis_time': datetime.now().strftime("%Y%m%d_%H%M%S")
         }
-        
+
     except Exception as e:
         logging.error(f"Sharpness analysis failed: {str(e)}")
         raise
+
+
+def create_combined_sharpness_visualization(image, traditional_score, regional_sharpness,
+                                            template_score, combined_score, mtf_values):
+    """Create visualization showing results from both analysis methods"""
+    plt.figure(figsize=(15, 5))
+
+    # Original image with regional analysis
+    plt.subplot(131)
+    plt.imshow(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+    height, width = image.shape[:2]
+
+    # Draw center region
+    plt.plot(width // 2, height // 2, 'go', markersize=10)
+    plt.text(width // 2 - 60, height // 2 - 60,
+             f"Center: {regional_sharpness['center']:.1f}",
+             color='green')
+
+    # Draw corner regions
+    corners = [(50, 50), (width - 50, 50), (50, height - 50), (width - 50, height - 50)]
+    for i, corner in enumerate(corners):
+        if i < len(regional_sharpness['corners']):
+            plt.plot(corner[0], corner[1], 'go', markersize=10)
+            plt.text(corner[0] - 20, corner[1] - 20,
+                     f"{regional_sharpness['corners'][i]:.1f}",
+                     color='green')
+
+    plt.title('Regional Analysis')
+    plt.axis('off')
+
+    # MTF curve
+    plt.subplot(132)
+    plt.plot(mtf_values)
+    plt.title('MTF Curve')
+    plt.xlabel('Spatial Frequency')
+    plt.ylabel('MTF')
+    plt.grid(True)
+
+    # Scores summary
+    plt.subplot(133)
+    scores = [traditional_score, template_score, combined_score]
+    labels = ['Traditional', 'Template', 'Combined']
+    plt.bar(labels, scores)
+    plt.title('Sharpness Scores')
+    plt.ylim(0, 100)
+
+    # Save visualization
+    viz_path = os.path.join(
+        os.path.dirname(image.filename),
+        f"combined_sharpness_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+    )
+    plt.tight_layout()
+    plt.savefig(viz_path)
+    plt.close()
+
+    return viz_path
 
 def calculate_physical_mtf(image):
     """Calculate MTF with physical constraints applied"""
@@ -286,9 +357,13 @@ def calculate_line_deviations(lines):
 
     return np.array(deviations)
 
+
 def analyze_distortion(image_path):
-    """Analyze lens distortion using a grid chart image"""
-    logging.info(f"Starting distortion analysis of image: {image_path}")
+    """
+    Analyze lens distortion using both edge detection and SIFT template matching.
+    Combines results for more robust distortion measurement.
+    """
+    logging.info(f"Starting comprehensive distortion analysis of image: {image_path}")
 
     try:
         # Load and preprocess image
@@ -310,7 +385,7 @@ def analyze_distortion(image_path):
         # Convert to grayscale
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-        # Apply threshold
+        # METHOD 1: Original edge-based analysis
         _, binary = cv2.threshold(gray, 128, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
         # Detect lines
@@ -338,26 +413,74 @@ def analyze_distortion(image_path):
             elif angle > 45:  # Vertical
                 v_lines.append((x1, y1, x2, y2))
 
-        # Calculate deviations
+        # Calculate edge-based deviations
         h_deviations = calculate_line_deviations(h_lines)
         v_deviations = calculate_line_deviations(v_lines)
+
+        # METHOD 2: SIFT-based template matching
+        # Create ideal grid template
+        template = np.zeros((300, 300), dtype=np.uint8)
+        spacing = 30
+        for i in range(0, 300, spacing):
+            cv2.line(template, (i, 0), (i, 299), 255, 2)
+            cv2.line(template, (0, i), (299, i), 255, 2)
+
+        # Initialize SIFT
+        sift = cv2.SIFT_create()
+
+        # Find keypoints and descriptors
+        kp1, des1 = sift.detectAndCompute(template, None)
+        kp2, des2 = sift.detectAndCompute(gray, None)
+
+        if des1 is not None and des2 is not None:
+            # Match features using FLANN
+            FLANN_INDEX_KDTREE = 1
+            index_params = dict(algorithm=FLANN_INDEX_KDTREE, trees=5)
+            search_params = dict(checks=50)
+            flann = cv2.FlannBasedMatcher(index_params, search_params)
+            matches = flann.knnMatch(des1, des2, k=2)
+
+            # Get good matches
+            good_matches = []
+            for m, n in matches:
+                if m.distance < 0.7 * n.distance:
+                    good_matches.append(m)
+
+            if len(good_matches) > 10:
+                # Calculate SIFT-based metrics
+                src_pts = np.float32([kp1[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+                dst_pts = np.float32([kp2[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+
+                # Calculate displacements
+                displacements = np.sqrt(np.sum((dst_pts - src_pts) ** 2, axis=2))
+                sift_displacement = float(np.mean(displacements))
+
+                # Calculate radial distortion
+                center = np.mean(dst_pts, axis=0)[0]
+                radial_distances = np.sqrt(np.sum((dst_pts - center) ** 2, axis=2))
+                ideal_distances = np.sqrt(np.sum((src_pts - center) ** 2, axis=2))
+                k = np.mean(radial_distances / ideal_distances) - 1
+            else:
+                sift_displacement = None
+                k = None
+        else:
+            sift_displacement = None
+            k = None
 
         # Create visualization
         viz_img = img.copy()
 
-        # Draw detected lines
-        for x1, y1, x2, y2 in h_lines:
-            cv2.line(viz_img, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        for x1, y1, x2, y2 in v_lines:
+        # Draw detected lines from Method 1
+        for x1, y1, x2, y2 in h_lines + v_lines:
             cv2.line(viz_img, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
-        # Calculate metrics
-        h_dev = np.mean(h_deviations) if len(h_deviations) > 0 else 0
-        v_dev = np.mean(v_deviations) if len(v_deviations) > 0 else 0
-        avg_deviation = (h_dev + v_dev) / 2 if (len(h_deviations) > 0 or len(v_deviations) > 0) else 0
-
-        # Calculate distortion score (0-100, higher is better)
-        distortion_score = 100 * (1 - min(avg_deviation / 50, 1))
+        # Draw SIFT matches if available
+        if sift_displacement is not None:
+            for pt1, pt2 in zip(src_pts, dst_pts):
+                p1 = tuple(map(int, pt1[0]))
+                p2 = tuple(map(int, pt2[0]))
+                cv2.circle(viz_img, p2, 3, (0, 0, 255), -1)
+                cv2.line(viz_img, p1, p2, (255, 0, 0), 1)
 
         # Save visualization
         viz_path = os.path.join(
@@ -366,17 +489,47 @@ def analyze_distortion(image_path):
         )
         cv2.imwrite(viz_path, viz_img)
 
+        # Calculate combined metrics
+        h_dev = np.mean(h_deviations) if len(h_deviations) > 0 else 0
+        v_dev = np.mean(v_deviations) if len(v_deviations) > 0 else 0
+        edge_deviation = (h_dev + v_dev) / 2 if (len(h_deviations) > 0 or len(v_deviations) > 0) else 0
+
+        # Calculate final combined score
+        edge_score = 100 * (1 - min(edge_deviation / 50, 1))
+        sift_score = 100 * (1 - min(sift_displacement / 50, 1)) if sift_displacement is not None else None
+
+        # Combine scores with weights if both methods succeeded
+        if sift_score is not None:
+            final_score = 0.4 * edge_score + 0.6 * sift_score
+        else:
+            final_score = edge_score
+
+        # Determine distortion type using both methods
+        edge_type = 'barrel' if edge_deviation > 0 else 'pincushion'
+        sift_type = 'barrel' if k is not None and k > 0 else 'pincushion'
+
+        # Use SIFT type if available, otherwise fall back to edge type
+        distortion_type = sift_type if k is not None else edge_type
+
         results = {
-            'horizontal_deviations': h_deviations.tolist(),
-            'vertical_deviations': v_deviations.tolist(),
-            'average_deviation': float(avg_deviation),
-            'distortion_score': float(distortion_score),
+            'edge_based': {
+                'horizontal_deviations': h_deviations.tolist() if len(h_deviations) > 0 else [],
+                'vertical_deviations': v_deviations.tolist() if len(v_deviations) > 0 else [],
+                'average_deviation': float(edge_deviation),
+                'score': float(edge_score)
+            },
+            'sift_based': {
+                'displacement': float(sift_displacement) if sift_displacement is not None else None,
+                'radial_coefficient': float(k) if k is not None else None,
+                'score': float(sift_score) if sift_score is not None else None
+            },
+            'combined_score': float(final_score),
+            'distortion_type': distortion_type,
             'visualization_path': viz_path,
-            'type': 'barrel' if avg_deviation > 0 else 'pincushion',
             'analysis_time': datetime.now().strftime("%Y%m%d_%H%M%S")
         }
 
-        logging.info(f"Analysis complete. Score: {distortion_score:.2f}")
+        logging.info(f"Analysis complete. Combined score: {final_score:.2f}")
         return results
 
     except Exception as e:
@@ -1192,3 +1345,112 @@ def import_raw_file(raw_path, processing_options=None):
     except Exception as e:
         logging.error(f"Error importing RAW file {raw_path}: {e}")
         raise
+
+
+def match_template_sift(image_path, template_path, threshold=0.7):
+    """
+    Match template in image using SIFT features and homography.
+
+    Args:
+        image_path: Path to main image
+        template_path: Path to template to find
+        threshold: SIFT matching threshold (0-1)
+
+    Returns:
+        matches_mask: Mask of matched points
+        homography: Transformation matrix between template and image
+        match_points: Coordinates of matched points
+    """
+    # Load image and template, converting to grayscale for SIFT
+    if image_path.lower().endswith(('.cr2', '.nef', '.arw')):
+        with rawpy.imread(image_path) as raw:
+            image = raw.postprocess(
+                use_camera_wb=True,
+                half_size=True,
+                no_auto_bright=True,
+                output_bps=8
+            )
+            image = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    else:
+        image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+
+    template = cv2.imread(template_path, cv2.IMREAD_GRAYSCALE)
+
+    if image is None or template is None:
+        raise ValueError("Failed to load image or template")
+
+    # Initialize SIFT detector
+    sift = cv2.SIFT_create()
+
+    # Find keypoints and descriptors
+    kp1, des1 = sift.detectAndCompute(template, None)
+    kp2, des2 = sift.detectAndCompute(image, None)
+
+    if des1 is None or des2 is None:
+        return None, None, []
+
+    # Match descriptors using FLANN
+    FLANN_INDEX_KDTREE = 1
+    index_params = dict(algorithm=FLANN_INDEX_KDTREE, trees=5)
+    search_params = dict(checks=50)
+    flann = cv2.FlannBasedMatcher(index_params, search_params)
+    matches = flann.knnMatch(des1, des2, k=2)
+
+    # Store good matches using Lowe's ratio test
+    good_matches = []
+    for m, n in matches:
+        if m.distance < threshold * n.distance:
+            good_matches.append(m)
+
+    if len(good_matches) < 4:
+        return None, None, []
+
+    # Extract matched keypoints
+    src_pts = np.float32([kp1[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+    dst_pts = np.float32([kp2[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+
+    # Find homography
+    homography, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+    matches_mask = mask.ravel().tolist()
+
+    # Get matched point coordinates
+    match_points = [(int(dst_pts[i][0][0]), int(dst_pts[i][0][1]))
+                    for i, match in enumerate(matches_mask) if match]
+
+    return matches_mask, homography, match_points
+
+
+def create_template_visualization(image_path, template_path, matches_mask, match_points):
+    """Create visualization of template matching results"""
+    # Load images in color for visualization
+    if image_path.lower().endswith(('.cr2', '.nef', '.arw')):
+        with rawpy.imread(image_path) as raw:
+            image = raw.postprocess()
+    else:
+        image = cv2.imread(image_path)
+
+    # Draw matched points
+    viz = image.copy()
+    for point in match_points:
+        cv2.circle(viz, point, 5, (0, 255, 0), -1)
+
+    # Save visualization
+    viz_path = os.path.join(
+        os.path.dirname(image_path),
+        f"template_match_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+    )
+    cv2.imwrite(viz_path, viz)
+    return viz_path
+
+
+
+
+def extract_roi(image, center_point, size=100):
+    """Extract region of interest around center point"""
+    x, y = center_point
+    half_size = size // 2
+    return image[
+           max(0, y - half_size):min(image.shape[0], y + half_size),
+           max(0, x - half_size):min(image.shape[1], x + half_size)
+           ]
+

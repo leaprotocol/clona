@@ -110,3 +110,4 @@ analysis_results/
 captures/
 datasets/
 testfiles/**
+.nicegui/

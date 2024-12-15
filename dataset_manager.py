@@ -308,3 +308,23 @@ class DatasetManager:
         except Exception as e:
             logging.error(f"Error updating scenario: {e}")
             return False
+
+    def update_dataset(self, dataset):
+        """Update dataset information"""
+        try:
+            dataset_id = dataset['id']
+            info_path = os.path.join(self.base_path, dataset_id, "info.json")
+            
+            if not os.path.exists(info_path):
+                logging.error(f"Dataset {dataset_id} not found")
+                return False
+            
+            with open(info_path, 'w') as f:
+                json.dump(dataset, f, indent=2)
+            
+            logging.info(f"Updated dataset {dataset_id}")
+            return True
+            
+        except Exception as e:
+            logging.error(f"Error updating dataset: {e}")
+            return False

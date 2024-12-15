@@ -10,7 +10,7 @@ def main():
         format='%(asctime)s [%(levelname)s] %(message)s'
     )
     
-    logging.debug("Starting Clona Lens Analysis Application")
+    logging.debug("Starting Clona Lens Evaluation Application")
     
     try:
         # Initialize managers
