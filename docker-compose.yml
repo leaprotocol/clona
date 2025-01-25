@@ -1,0 +1,28 @@
+version: '3.7'
+
+services:
+  traefik:
+    image: traefik:v2.9
+    command:
+      - "--api.insecure=true"
+      - "--providers.docker"
+      - "--entrypoints.web.address=:80"
+    ports:
+      - "80:80"
+      - "8080:8080"
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+
+  clona-app:
+    build: .
+    container_name: clona-app
+    labels:
+      - "traefik.http.routers.clona.rule=Host(`reangue.com`) && PathPrefix(`/clona`)"
+      - "traefik.http.services.clona.loadbalancer.server.port=8000"
+    ports:
+      - "8000:8000"
+    devices:
+      - "/dev/bus/usb:/dev/bus/usb"
+    volumes:
+      - ./datasets:/app/datasets
+    restart: unless-stopped 

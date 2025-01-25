@@ -107,3 +107,21 @@ This project is licensed under the MIT License. See the LICENSE file for more de
 ## Contact
 
 For any questions or inquiries, please contact Lea Králová at lea.kralova00@gmail.com .
+
+## Running with Docker
+
+To run the container with USB device access:
+
+1. Identify the USB device using `lsusb`:
+   ```bash
+   lsusb
+   ```
+
+2. Update the `docker-compose.yml` file with the correct device path.
+
+3. Start the container:
+   ```bash
+   docker-compose up
+   ```
+
+For more information, see the [Docker documentation](https://docs.docker.com/engine/reference/commandline/run/#add-host-device-to-container---device).
