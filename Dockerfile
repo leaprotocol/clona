@@ -23,20 +23,17 @@ RUN mkdir -p /app/datasets
 # Create a volume for datasets
 VOLUME /app/datasets
 
-# Copy the current directory contents into the container at /app
+# Copy requirements file first for caching
+COPY requirements.txt .
+
+# Install Python dependencies with no cache
+RUN pip install --no-cache-dir setuptools wheel && pip install --no-cache-dir -r requirements.txt
+
+# Copy the rest of the application code
 COPY . .
 
-# Install Python dependencies
-RUN pip install setuptools && pip install -r requirements.txt
-
 # Make port 8000 available to the world outside this container
-EXPOSE 8000
+EXPOSE 8080
 
 # Run the application
 CMD ["python", "main.py"]
-
-# To run this container with USB device access and mount the datasets volume, use:
-# docker run --device=/dev/bus/usb -p 8000:8000 -v ./datasets:/app/datasets clona-app
-
-# Or with absolute path:
-# docker run --device=/dev/bus/usb -p 8000:8000 -v $(pwd)/datasets:/app/datasets clona-app
