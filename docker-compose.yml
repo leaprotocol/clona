@@ -19,9 +19,9 @@ services:
     labels:
       - "traefik.http.routers.clona.rule=Host(`reangue.com`) && PathPrefix(`/clona`)"
       - "traefik.http.routers.clona.entrypoints=web"
-      - "traefik.http.services.clona.loadbalancer.server.port=8000"
+      - "traefik.http.services.clona.loadbalancer.server.port=8080"
     ports:
-      - "8000:8000"
+      - "80:8080"
     devices:
       - "/dev/bus/usb:/dev/bus/usb"
     volumes:
