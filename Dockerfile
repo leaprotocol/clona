@@ -26,14 +26,18 @@ VOLUME /app/datasets
 # Copy requirements file first for caching
 COPY requirements.txt .
 
-# Install Python dependencies with no cache
-RUN pip install --no-cache-dir setuptools wheel && pip install --no-cache-dir -r requirements.txt
+# Install Python dependencies
+RUN pip install setuptools && pip install -r requirements.txt
 
 # Copy the rest of the application code
 COPY . .
 
-# Make port 8000 available to the world outside this container
+# Expose the port NiceGUI will run on
 EXPOSE 8080
+
+# Set environment variables for NiceGUI
+ENV NICEGUI_HOST=0.0.0.0
+ENV NICEGUI_PORT=8080
 
 # Run the application
 CMD ["python", "main.py"]

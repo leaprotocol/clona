@@ -12,9 +12,6 @@ services:
       - "8080:8080"
     volumes:
       - "/var/run/docker.sock:/var/run/docker.sock:ro"
-      - "./letsencrypt:/letsencrypt"
-    depends_on:
-      - clona-app
     networks:
       - webnet
 
@@ -22,9 +19,15 @@ services:
     build: .
     container_name: clona-app
     labels:
-      - "traefik.http.routers.clona.rule=Host(`reangue.com`) && Path(`/clona`)"
+      - "traefik.enable=true"
+      - "traefik.http.routers.clona.rule=Host(`reangue.com`)"
       - "traefik.http.routers.clona.entrypoints=web"
       - "traefik.http.services.clona.loadbalancer.server.port=8080"
+      - "traefik.http.middlewares.clona-strip.stripprefix.prefixes=/clona"
+      - "traefik.http.routers.clona.middlewares=clona-strip@docker"
+    environment:
+      - NICEGUI_HOST=0.0.0.0
+      - NICEGUI_PORT=8080
     devices:
       - "/dev/bus/usb:/dev/bus/usb"
     volumes:
