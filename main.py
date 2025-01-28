@@ -23,7 +23,7 @@ def main():
         # Create and run UI
         logging.debug("Starting UI...")
         ui = LensAnalysisUI(camera_manager, dataset_manager)
-        ui.run(host='0.0.0.0')
+        ui.run()
 
     except Exception as e:
         logging.error(f"Application error: {e}")
