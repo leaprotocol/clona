@@ -7,17 +7,25 @@ services:
       - "--api.insecure=true"
       - "--providers.docker"
       - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      - "--certificatesresolvers.myresolver.acme.tlschallenge=true"
+      - "--certificatesresolvers.myresolver.acme.email=your-email@example.com"
+      - "--certificatesresolvers.myresolver.acme.storage=/letsencrypt/acme.json"
     ports:
       - "80:80"
+      - "443:443"
       - "8080:8080"
     volumes:
       - "/var/run/docker.sock:/var/run/docker.sock:ro"
+      - "./letsencrypt:/letsencrypt"
 
   clona-app:
     build: .
     container_name: clona-app
     labels:
       - "traefik.http.routers.clona.rule=Host(`reangue.com`) && PathPrefix(`/clona`)"
+      - "traefik.http.routers.clona.entrypoints=web,websecure"
+      - "traefik.http.routers.clona.tls.certresolver=myresolver"
       - "traefik.http.services.clona.loadbalancer.server.port=8000"
     ports:
       - "8000:8000"
