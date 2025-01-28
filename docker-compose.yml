@@ -22,7 +22,7 @@ services:
     build: .
     container_name: clona-app
     labels:
-      - "traefik.http.routers.clona.rule=Host(`reangue.com`) && PathPrefix(`/clona`)"
+      - "traefik.http.routers.clona.rule=Host(`reangue.com`) && Path(`/clona`)"
       - "traefik.http.routers.clona.entrypoints=web"
       - "traefik.http.services.clona.loadbalancer.server.port=8080"
     devices:
