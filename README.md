@@ -38,26 +38,26 @@ This project is part of a diploma thesis focused on developing an application fo
    git clone <repository_url>
    cd <repository_directory>
    ```
-
-2. **Create a virtual environment and activate it:**
-   ```bash
-   python3 -m venv venv
-   source venv/bin/activate  # on Linux/Mac
-   venv\Scripts\activate  # on Windows
-   ```
-
-3. **Install the required dependencies:**
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-4. **Install system dependencies:**
+2. **Install system dependencies:**
    ```bash
    sudo apt-get update && sudo apt-get install -y \
        libgphoto2-dev libcairo2-dev libgirepository1.0-dev \
        build-essential pkg-config python3-dev gir1.2-gtk-3.0 \
        libgl1-mesa-glx libgl1-mesa-dri gphoto2
    ```
+
+3. **Create a virtual environment and activate it:**
+   ```bash
+   python3 -m venv venv
+   source venv/bin/activate  # on Linux/Mac
+   venv\Scripts\activate  # on Windows
+   ```
+
+4. **Install the required dependencies:**
+   ```bash
+   pip install -r requirements.txt
+   ```
+
 
 5. **Run the application:**
    ```bash
