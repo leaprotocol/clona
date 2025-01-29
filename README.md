@@ -24,11 +24,12 @@ This project is part of a diploma thesis focused on developing an application fo
 
 2. **Build and run the Docker container:**
    ```bash
-   docker-compose up -d
+   docker-compose up -d clona-app
    ```
+   **Note**: When developing locally, you usually don't need Traefik. To run just the application container without Traefik, use the command `docker-compose up clona-app -d`. This will start only the application and make it accessible on `http://localhost:8080`.
 
 3. **Access the application:**
-   - Open your browser and go to `http://reangue.com/clona`.
+   - Open your browser and go to `  http://localhost:8080`.
 
 ### Non-Docker
 
