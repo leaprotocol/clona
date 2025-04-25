@@ -111,3 +111,5 @@ captures/
 datasets/
 testfiles/**
 .nicegui/
+training_data/
+training_data_ignored/
