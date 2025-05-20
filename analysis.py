@@ -16,11 +16,27 @@ import shutil
 
 def analyze_sharpness(image_path, patterns_dir=None):
     """
-    Analyzes lens sharpness using SIFT keypoint response strength.
+    Analyze the sharpness of a lens from an image. This measures how well the lens can resolve fine detail and contrast, combining traditional edge/MTF analysis and SIFT keypoint response.
+
+    Formula:
+        S = w_a * A + w_k * K
+    Where:
+        S = combined_score (final sharpness score)
+        A = traditional_score (MTF-based or edge-based score)
+        K = sift_score (SIFT keypoint response score)
+        w_a, w_k = weights (0.7, 0.3)
+
+    The traditional score (A) is calculated from MTF values using weighted area under the curve,
+    normalized to 0-100 scale and capped at 95 to account for physical limits of lens resolution.
     
+    The SIFT score (K) is derived from keypoint responses in both center and corner regions,
+    normalized to 0-100 scale.
+
     Args:
-        image_path: Path to captured image
-        patterns_dir: Optional directory containing template patterns (not used yet)
+        image_path (str): Path to captured image
+        patterns_dir (str, optional): Directory containing template patterns (not used yet)
+    Returns:
+        dict: Dictionary with sharpness_score (S), traditional_score (A), sift_score (K), and other metrics
     """
     try:
         # Load and preprocess image
@@ -391,7 +407,25 @@ def calculate_line_deviations(lines):
 
 
 def analyze_distortion(image_path):
-    """Comprehensive lens distortion analysis with enhanced logging"""
+    """
+    Analyze geometric distortion in an image. This measures how much straight lines are bent by the lens, indicating barrel or pincushion distortion.
+
+    Formula:
+        D_score = 100 * (1 - min(1, total_deviation))
+    Where:
+        D_score = edge_score (distortion score)
+        total_deviation = average of mean deviations (h_dev, v_dev, mean_deviation)
+
+    The total_deviation is calculated as (h_dev + v_dev + mean_deviation) / 3, where:
+    - h_dev: Mean horizontal line deviation (curvature from polynomial fit)
+    - v_dev: Mean vertical line deviation (curvature from polynomial fit)
+    - mean_deviation: Mean grid cell deviation (combining distance and angle variations)
+
+    Args:
+        image_path (str): Path to the image to analyze
+    Returns:
+        dict: Dictionary with edge_score (D_score), distortion_type, total_deviation, and logs/visualizations
+    """
     # Create a detailed log for this specific analysis
     analysis_log = {
         'input_image': image_path,
@@ -604,7 +638,18 @@ def analyze_distortion(image_path):
         }
 
 def filter_significant_lines(lines, min_length=30, max_angle_deviation=30):
-    """More sensitive line filtering with adaptive parameters"""
+    """
+    More sensitive line filtering with adaptive parameters.
+    
+    Filters detected lines based on length and alignment with horizontal or vertical axes.
+    
+    Args:
+        lines: Lines detected by Hough transform
+        min_length: Minimum acceptable line length in pixels
+        max_angle_deviation: Maximum angle deviation from horizontal/vertical in degrees
+    Returns:
+        list: Filtered significant lines
+    """
     if lines is None:
         return []
     
@@ -629,7 +674,17 @@ def filter_significant_lines(lines, min_length=30, max_angle_deviation=30):
     return significant_lines
 
 def compute_line_deviations(lines):
-    """Enhanced line deviation calculation"""
+    """
+    Enhanced line deviation calculation.
+    
+    Measures line curvature by fitting a polynomial to points along each line
+    and extracting the quadratic coefficient, which represents curvature.
+    
+    Args:
+        lines: List of detected lines
+    Returns:
+        tuple: (deviations array, mean deviation)
+    """
     if not lines:
         return np.array([]), 0
 
@@ -654,8 +709,24 @@ def compute_line_deviations(lines):
     return deviations, np.mean(deviations) if len(deviations) > 0 else 0
 
 def analyze_vignetting(image_path):
-    """Analyze vignetting in an image
-    Returns a dictionary of measurements including center-to-corner ratios
+    """
+    Analyze vignetting in an image. This measures how much the corners of the image are darkened compared to the center, a common lens artifact.
+
+    Formula:
+        V_score = 100 * average_ratio
+    Where:
+        V_score = vignetting_score (final vignetting score)
+        average_ratio = mean of corner_ratios
+        corner_ratios = {corner: intensity / center_intensity}
+
+    For each corner and the center, outlier pixel values are removed using interquartile range (IQR)
+    filtering before calculating mean intensities. The corner ratios are clipped to [0.0, 2.0]
+    range before averaging, and the final score is capped at 100.
+
+    Args:
+        image_path (str): Path to the image to analyze
+    Returns:
+        dict: Dictionary with vignetting_score (V_score), center_intensity, corner_intensities, corner_ratios, and visualization path
     """
     logging.info(f"Starting analysis of image: {image_path}")
 
@@ -872,14 +943,34 @@ def analyze_scenario_photo(scenario, photo_info):
 
 def analyze_bokeh(image_path, click_x, click_y, metadata=None):
     """
-    Analyze bokeh from a single clicked point
+    Analyze bokeh quality from a selected region in an image. This measures the roundness, smoothness, and color fringing of out-of-focus highlights (bokeh spots).
+
+    Formula:
+        B_score = (S + F + I) / 3
+    Where:
+        B_score = overall_score (final bokeh score)
+        S = shape_regularity (shape regularity score)
+        F = color_fringing (color fringing score)
+        I = intensity_distribution (intensity distribution score)
+
+    Shape regularity (S) combines circularity and contour matching:
+        S = circularity * 50 + (1 - matching_score) * 50
+    
+    Color fringing (F) is computed as:
+        F = 100 * (1 - min(avg_color_diff / 255, 1.0))
+        
+    Intensity distribution (I) is the average of uniformity and falloff scores:
+        I = (uniformity_score + falloff_score) / 2
+        uniformity_score = 100 * (1 - min(std_intensity / mean_intensity, 1.0))
+        falloff_score = 100 * (1 - min(abs(intensity_gradient) / 2.0, 1.0))
 
     Args:
-        image_path: Path to image file
-        click_x, click_y: Coordinates where user clicked
-
+        image_path (str): Path to image file
+        click_x (int): X coordinate where user clicked
+        click_y (int): Y coordinate where user clicked
+        metadata (dict, optional): Additional metadata for the analysis
     Returns:
-        Dictionary containing analysis results and visualizations
+        dict: Dictionary with overall_score (B_score), shape_regularity (S), color_fringing (F), intensity_distribution (I), and visualization path
     """
     logging.info(f"Starting bokeh analysis at point ({click_x}, {click_y})")
 
@@ -1216,15 +1307,25 @@ def create_bokeh_visualization(roi, center, radius, shape_metrics, color_metrics
 
 def analyze_chromatic_aberration(image_path):
     """
-    Analyze both lateral and longitudinal chromatic aberration in an image.
+    Analyze chromatic aberration in an image. This measures color fringing caused by the lens, both lateral (color misalignment at edges) and longitudinal (color fringing across contrast boundaries).
+
+    Formula:
+        CA_score = 100 * (1 - min(1, W_CA / W_threshold))
+    Where:
+        CA_score = lateral_score (chromatic aberration score)
+        W_CA = max_displacement (maximum centroid offset)
+        W_threshold = 3.0 (reference value)
+
+    The final chromatic aberration score combines lateral and longitudinal components:
+        overall_score = lateral_score * 0.6 + longitudinal_score * 0.4
     
+    Lateral CA measures maximum displacement between RGB channel centroids.
+    Longitudinal CA measures color fringing intensity using mean absolute differences between channels.
+
+    Args:
+        image_path (str): Path to the image to analyze
     Returns:
-        Dictionary containing:
-        - chromatic_aberration_score: Overall score (0-100)
-        - lateral_ca: Lateral chromatic aberration measurements
-        - longitudinal_ca: Longitudinal chromatic aberration measurements
-        - visualization_path: Path to generated visualization
-        - channel_differences: Color channel difference metrics
+        dict: Dictionary with chromatic_aberration_score (CA_score), lateral_ca, longitudinal_ca, and visualization path
     """
     logging.info(f"Starting chromatic aberration analysis of image: {image_path}")
 
@@ -1288,7 +1389,15 @@ def analyze_chromatic_aberration(image_path):
         raise
 
 def analyze_lateral_ca(r, g, b, edge_region):
-    """Analyze lateral chromatic aberration by measuring RGB misalignment"""
+    """
+    Analyze lateral chromatic aberration by measuring RGB misalignment.
+    
+    Calculates the center of mass (centroid) for each color channel in the edge regions,
+    then measures the Euclidean distances between these centroids.
+    
+    Returns:
+        dict: Contains 'displacements' (distances between channel pairs) and 'centers' (centroid coordinates)
+    """
     # Calculate center of mass for each channel along edges
     r_com = cv2.moments(cv2.bitwise_and(r, r, mask=edge_region))
     g_com = cv2.moments(cv2.bitwise_and(g, g, mask=edge_region))
@@ -1315,7 +1424,15 @@ def analyze_lateral_ca(r, g, b, edge_region):
     }
 
 def analyze_longitudinal_ca(r, g, b, edge_region):
-    """Analyze longitudinal chromatic aberration through color intensity ratios"""
+    """
+    Analyze longitudinal chromatic aberration through color intensity ratios and fringing.
+    
+    Calculates intensity ratios between color channels and measures color fringing using
+    mean absolute differences between channels.
+    
+    Returns:
+        dict: Contains 'intensity_ratios' and 'fringing_metrics' between channel pairs
+    """
     # Calculate color ratios along edges
     r_intensity = cv2.mean(r, mask=edge_region)[0]
     g_intensity = cv2.mean(g, mask=edge_region)[0]
@@ -1341,7 +1458,16 @@ def analyze_longitudinal_ca(r, g, b, edge_region):
     }
 
 def calculate_lateral_ca_score(lateral_ca):
-    """Calculate score for lateral CA (0-100, higher is better)"""
+    """
+    Calculate score for lateral CA (0-100, higher is better).
+    
+    Formula: score = 100 * (1 - min(max_displacement / 3.0, 1.0))
+    
+    Args:
+        lateral_ca (dict): Results from lateral CA analysis
+    Returns:
+        float: Lateral CA score (0-100)
+    """
     max_displacement = max(lateral_ca['displacements'].values())
     # Convert displacement to score (0-100)
     # Typical threshold for noticeable CA is around 1-2 pixels
@@ -1349,7 +1475,16 @@ def calculate_lateral_ca_score(lateral_ca):
     return score
 
 def calculate_longitudinal_ca_score(longitudinal_ca):
-    """Calculate score for longitudinal CA (0-100, higher is better)"""
+    """
+    Calculate score for longitudinal CA (0-100, higher is better).
+    
+    Formula: score = 100 * (1 - min(max_fringing / 255.0, 1.0))
+    
+    Args:
+        longitudinal_ca (dict): Results from longitudinal CA analysis
+    Returns:
+        float: Longitudinal CA score (0-100)
+    """
     max_fringing = max(longitudinal_ca['fringing_metrics'].values())
     # Convert fringing to score (0-100)
     score = 100 * (1 - min(max_fringing / 255.0, 1.0))
