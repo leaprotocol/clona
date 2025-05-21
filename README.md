@@ -52,7 +52,7 @@ This project is part of a diploma thesis focused on developing an application fo
    sudo apt-get update && sudo apt-get install -y \
        libgphoto2-dev libcairo2-dev libgirepository1.0-dev \
        build-essential pkg-config python3-dev gir1.2-gtk-3.0 \
-       libgl1-mesa-glx libgl1-mesa-dri gphoto2
+       libgl1-mesa-dri gphoto2
    ```
 
 3. **Create a virtual environment and activate it (Python 3.12 or higher recommended):**
